@@ -1,0 +1,22 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+pet_debug.log
+settings.txt
+keybindings.txt
+
+# Local reference dumps used to cross-check Celeste behavior/assets.
+celeste_graphics_dump/
+celeste_reference/
+example_skins/
+
+# Where Celeste is installed, when it is somewhere unusual. One line, the folder holding
+# Celeste.exe. A development file only: -p:BundleAssets=true and tools\dump-reference.ps1
+# read it, the app never does -- for it an install is the CelestePath setting, CELESTE_PATH,
+# or looking. Yours, so it is not committed.
+celeste-path.txt
+
+/macOS/.build.*/
+/macOS/.check.*/

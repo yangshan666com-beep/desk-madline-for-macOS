@@ -1,0 +1,160 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>DeskMadeline</AssemblyName>
+    <RootNamespace>DeskMadeline</RootNamespace>
+    <!-- GameCanvas keeps its pixels in write-watched native memory. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>1.0.0</Version>
+
+    <!--
+      Two builds come out of this tree.
+
+        dotnet build -c Release                        the one to hand out: no artwork and no
+                                                       audio of Celeste's travels with it, and
+                                                       both are read from an installed copy of
+                                                       the game at startup.
+
+        dotnet build -c Release -p:BundleAssets=true   the one for a machine without Celeste:
+                                                       assets\ is copied beside the exe, and
+                                                       so are the FMOD banks and libraries if
+                                                       CELESTE_PATH points at an install to
+                                                       take them from.
+
+      The app itself needs no flag to tell them apart: it reads assets\ when they are there
+      and the game's own atlases and banks when they are not.
+    -->
+    <BundleAssets Condition="'$(BundleAssets)' == ''">false</BundleAssets>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(BundleAssets)' == 'true'">
+    <DefineConstants>$(DefineConstants);BUNDLED_ASSETS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DirectComposition" Version="3.8.3" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="obj\**" />
+    <Compile Remove="macOS/**;windows/**" />
+    <!-- Source material for comparison only; it is not part of the desktop-pet app. -->
+    <Compile Remove="celeste_reference\**" />
+    <!-- The checks compile these same sources into their own assembly; see tests\README.md. -->
+    <Compile Remove="tests\**" />
+    <!-- What is left in assets\ is not Celeste's and ships either way: the elytra frames
+         from CommunalHelper, the cat bangs, a stand-in for a particle the game draws as a
+         rectangle, and her portrait, which is also the tray icon. -->
+    <None Include="assets\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="THIRD_PARTY_NOTICES.md">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!--
+    Which commit this was built from, stamped into the assembly for the About window to show.
+    A version number nobody remembers to bump says nothing about what somebody is running; the
+    commit says exactly. Both readings are asked of git rather than kept in a file, so there is
+    nothing to forget to update; a tree with no git to ask of, a source zip say, simply does not
+    get them and the About window falls back to the version above.
+
+    Git's format specifier has to survive two readers to reach it. MSBuild reads %XX as an
+    escape, so a literal percent is written %25; Exec then runs the command through a batch
+    file, which eats a single percent, so it takes two of them.
+  -->
+  <Target Name="StampCommit" BeforeTargets="GetAssemblyAttributes">
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-parse --short=7 HEAD" ConsoleToMSBuild="true" StandardOutputImportance="low" ContinueOnError="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CommitHash" />
+      <Output TaskParameter="ExitCode" PropertyName="CommitHashExit" />
+    </Exec>
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; log -1 --format=%25%25cI" ConsoleToMSBuild="true" StandardOutputImportance="low" ContinueOnError="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CommitDate" />
+    </Exec>
+    <!--
+      The build number: how many commits lead up to this one, which only ever goes up along
+      master. A shallow clone has only the last few to count and would call every build #1, so
+      it gets no number at all rather than a wrong one; CI checks out the whole history for this.
+    -->
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-parse --is-shallow-repository" ConsoleToMSBuild="true" StandardOutputImportance="low" ContinueOnError="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CommitShallow" />
+    </Exec>
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-list --count HEAD" Condition="'$(CommitShallow.Trim())' == 'false'" ConsoleToMSBuild="true" StandardOutputImportance="low" ContinueOnError="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CommitNumber" />
+      <Output TaskParameter="ExitCode" PropertyName="CommitNumberExit" />
+    </Exec>
+    <ItemGroup Condition="'$(CommitHashExit)' == '0' And '$(CommitHash)' != ''">
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CommitHash</_Parameter1>
+        <_Parameter2>$(CommitHash.Trim())</_Parameter2>
+      </AssemblyAttribute>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CommitDate</_Parameter1>
+        <_Parameter2>$(CommitDate.Trim())</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+    <ItemGroup Condition="'$(CommitNumberExit)' == '0' And '$(CommitNumber)' != ''">
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>CommitNumber</_Parameter1>
+        <_Parameter2>$(CommitNumber.Trim())</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
+
+  <!--
+    A bundled build carries Celeste's own artwork and audio so it can run on a machine without
+    the game. Neither belongs in this repository, so both are copied out of an install at
+    build time, in the layout the game uses and the app already knows how to read: the
+    gameplay atlas, her portrait, and the FMOD runtime and banks. Name an install with
+    -p:CelestePath=...; without one the bundled build has nothing to carry, and says so.
+  -->
+  <Target Name="BundleCelesteContent" AfterTargets="Build" Condition="'$(BundleAssets)' == 'true'">
+    <PropertyGroup>
+      <!-- Three ways to say where Celeste is, in the order they are taken:
+           -p:CelestePath=..., the CELESTE_PATH environment variable, or a celeste-path.txt
+           beside this project holding the path on one line, which saves saying it at all. -->
+      <CelestePathFile>$(MSBuildProjectDirectory)\celeste-path.txt</CelestePathFile>
+      <CelesteDir>$(CelestePath)</CelesteDir>
+      <CelesteDir Condition="'$(CelesteDir)' == ''">$(CELESTE_PATH)</CelesteDir>
+      <CelesteDir Condition="'$(CelesteDir)' == '' And Exists('$(CelestePathFile)')">$([System.String]::Copy('$([System.IO.File]::ReadAllText($(CelestePathFile)))').Trim())</CelesteDir>
+      <!-- A path pasted with a trailing slash arrives with the closing quote stuck to it. -->
+      <CelesteDir>$(CelesteDir.TrimEnd('"').TrimEnd('\'))</CelesteDir>
+    </PropertyGroup>
+    <ItemGroup Condition="'$(CelesteDir)' != '' And Exists('$(CelesteDir)')">
+      <CelesteAtlas Include="$(CelesteDir)\Content\Graphics\Atlases\Gameplay.meta;&#xD;&#xA;                             $(CelesteDir)\Content\Graphics\Atlases\Gameplay*.data" />
+      <CelestePortrait Include="$(CelesteDir)\Content\Graphics\Atlases\Portraits\madeline\normal00.data" />
+      <!-- The game's sprite bank: every animation she plays, and where her hair sits and what
+           she carries on every frame. Read beside the exe or out of the install, the same two
+           places the atlas is looked for. 90KB. -->
+      <CelesteSprites Include="$(CelesteDir)\Content\Graphics\Sprites.xml" />
+      <!-- Whichever names this install has them under: newer Everest lib sets ship the
+           studio library as fmodstudio64.dll and older ones renamed it to fmodstudio.dll.
+           A copy of Celeste that Everest has not converted has neither, only the 32-bit
+           pair beside Celeste.exe, which a 64-bit build cannot load; hence the warning
+           below rather than a silent bundle. -->
+      <CelesteFmodLib Include="$(CelesteDir)\lib64-win-x64\fmod*.dll" />
+      <!-- The four SoundEffects loads. dlc_sfx.bank is needed despite its name: the jellyfish
+           is a Farewell mechanic, so its sounds are under event:/new_content/. The music
+           banks are 440MB of soundtrack nothing here can play, and stay out. SFXCHECK=1
+           plays every event the code names, which is what says whether this list is right. -->
+      <CelesteFmodBank Include="$(CelesteDir)\Content\FMOD\Desktop\Master Bank.bank;&#xD;&#xA;                                $(CelesteDir)\Content\FMOD\Desktop\Master Bank.strings.bank;&#xD;&#xA;                                $(CelesteDir)\Content\FMOD\Desktop\sfx.bank;&#xD;&#xA;                                $(CelesteDir)\Content\FMOD\Desktop\dlc_sfx.bank" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CelesteAtlas)" DestinationFolder="$(OutDir)Content\Graphics\Atlases" SkipUnchangedFiles="true" Condition="'@(CelesteAtlas)' != ''" />
+    <Copy SourceFiles="@(CelestePortrait)" DestinationFolder="$(OutDir)Content\Graphics\Atlases\Portraits\madeline" SkipUnchangedFiles="true" Condition="'@(CelestePortrait)' != ''" />
+    <Copy SourceFiles="@(CelesteSprites)" DestinationFolder="$(OutDir)Content\Graphics" SkipUnchangedFiles="true" Condition="'@(CelesteSprites)' != ''" />
+    <Copy SourceFiles="@(CelesteFmodLib)" DestinationFolder="$(OutDir)lib64-win-x64" SkipUnchangedFiles="true" Condition="'@(CelesteFmodLib)' != ''" />
+    <Copy SourceFiles="@(CelesteFmodBank)" DestinationFolder="$(OutDir)Content\FMOD\Desktop" SkipUnchangedFiles="true" Condition="'@(CelesteFmodBank)' != ''" />
+    <Warning Text="BundleAssets is on but '$(CelesteDir)' is not a Celeste install, so this build carries neither artwork nor audio. Name one with -p:CelestePath=..." Condition="'@(CelesteAtlas)' == ''" />
+    <Warning Text="'$(CelesteDir)' has no 64-bit FMOD in lib64-win-x64, so this bundled build will be silent. That runtime comes with Everest's build of Celeste; the plain game is the 32-bit one." Condition="'@(CelesteAtlas)' != '' And '@(CelesteFmodLib)' == ''" />
+  </Target>
+
+</Project>

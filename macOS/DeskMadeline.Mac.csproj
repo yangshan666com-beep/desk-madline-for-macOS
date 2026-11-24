@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>DeskMadeline</AssemblyName>
+    <RootNamespace>DeskMadeline</RootNamespace>
+    <DefineConstants>$(DefineConstants);DESK_MACOS;DESK_PIXEL</DefineConstants>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(IncludeMacChecks)' == 'true'">
+    <DefineConstants>$(DefineConstants);MAC_CHECKS</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(IncludeMacChecks)' == 'true'">
+    <Compile Include="../tests/DeskMadeline.Tests/AnimationChecks.cs;../tests/DeskMadeline.Tests/BumperChecks.cs;../tests/DeskMadeline.Tests/DreamChecks.cs;../tests/DeskMadeline.Tests/DreamHyperChecks.cs;../tests/DeskMadeline.Tests/GridChecks.cs;../tests/DeskMadeline.Tests/HairChecks.cs;../tests/DeskMadeline.Tests/IdleChecks.cs;../tests/DeskMadeline.Tests/LiftChecks.cs;../tests/DeskMadeline.Tests/MoveChecks.cs;../tests/DeskMadeline.Tests/PushChecks.cs;../tests/DeskMadeline.Tests/SoundChecks.cs;../tests/DeskMadeline.Tests/SpriteBankChecks.cs;../tests/DeskMadeline.Tests/SuperDashChecks.cs;../tests/DeskMadeline.Tests/WaterChecks.cs" Link="Checks/%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(IncludeMacChecks)' != 'true'">
+    <Compile Remove="MacChecks.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.119.4" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="3.119.4" GeneratePathProperty="true" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+    <Content Include="../assets/player/dashParticle.png" Link="assets/player/dashParticle.png" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../Player.cs;../Player.StarFly.cs;../Player.Booster.cs;../ActorSweep.cs;../Glider.cs;../PetHoldable.cs;../TheoCrystal.cs;../Seeker.cs;../Puffer.cs;../Bumper.cs" Link="Shared/%(Filename)%(Extension)" />
+    <Compile Include="../Sprites.cs;../SpriteBank.cs;../HairMeta.cs;../SkinModHelper.cs;../Particles.cs;../CelesteAtlas.cs;../CelesteInstall.cs" Link="Shared/%(Filename)%(Extension)" />
+    <Compile Include="../IdleDirector.cs;../IdleMoves.cs;../IdleNav.cs;../IdlePlanner.cs;../IntegerAxis.cs;../GrabMode.cs;../SoundEffects.cs;../FmodRuntime.cs" Link="Shared/%(Filename)%(Extension)" />
+  </ItemGroup>
+  <Target Name="PublishLicenses" AfterTargets="Publish" Condition="'$(IncludeMacChecks)' != 'true'">
+    <Copy SourceFiles="$(NetCoreRoot)LICENSE.txt;$(NetCoreRoot)ThirdPartyNotices.txt"
+          DestinationFiles="$(PublishDir)/licenses/dotnet-LICENSE.txt;$(PublishDir)/licenses/dotnet-THIRD-PARTY-NOTICES.txt"
+          Condition="Exists('$(NetCoreRoot)LICENSE.txt')" />
+    <Copy SourceFiles="$(PkgSkiaSharp_NativeAssets_macOS)/LICENSE.txt;$(PkgSkiaSharp_NativeAssets_macOS)/THIRD-PARTY-NOTICES.txt;Licenses/YamlDotNet.txt"
+          DestinationFiles="$(PublishDir)/licenses/SkiaSharp-LICENSE.txt;$(PublishDir)/licenses/SkiaSharp-THIRD-PARTY-NOTICES.txt;$(PublishDir)/licenses/YamlDotNet-LICENSE.txt" />
+  </Target>
+</Project>

@@ -1,0 +1,183 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using DeskMadeline;
+
+// Settings defaults: what a fresh install gets, and -- more importantly -- that changing a
+// default does not overwrite a preference somebody already saved.
+static class SettingsChecks
+{
+    static int failed;
+
+    static void Check(string what, bool ok)
+    {
+        Console.WriteLine($"    {(ok ? "ok  " : "FAIL")}  {what}");
+        if (!ok) failed++;
+    }
+
+    public static int Run()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "deskmadeline-defaults-check");
+        Directory.CreateDirectory(dir);
+
+        Console.WriteLine("  Fresh install (no settings.txt)");
+        string missing = Path.Combine(dir, "does-not-exist.txt");
+        if (File.Exists(missing)) File.Delete(missing);
+        var fresh = PetSettings.Load(missing);
+        Check("sound effects default to only-when-focused (SfxMode 1)", fresh.SfxMode == 1);
+        Check("respawn reversal animation defaults to on", fresh.RespawnReversalEnabled);
+        Check("ignore maximized/fullscreen windows defaults to on", fresh.IgnoreMaximizedWindows);
+        Check("stepping behind fullscreen windows defaults to on", fresh.AvoidFullscreen);
+
+        Console.WriteLine();
+        Console.WriteLine("  Existing settings.txt keeps what the user chose");
+        string saved = Path.Combine(dir, "settings.txt");
+        File.WriteAllLines(saved, new[]
+        {
+            "# DeskMadeline settings",
+            "SfxMode=0",
+            "RespawnReversalEnabled=False",
+            "IgnoreMaximizedWindows=False",
+            "Scale=8",
+        });
+        var existing = PetSettings.Load(saved);
+        Check("sound stays off for someone who turned it off", existing.SfxMode == 0);
+        Check("respawn reversal stays off for someone who turned it off", !existing.RespawnReversalEnabled);
+        Check("ignore maximized stays off for someone who turned it off", !existing.IgnoreMaximizedWindows);
+        Check("unrelated settings still load (Scale 8)", existing.Scale == 8);
+
+        Console.WriteLine();
+        Console.WriteLine("  Partially written settings.txt falls back to the new defaults");
+        string partial = Path.Combine(dir, "partial.txt");
+        File.WriteAllLines(partial, new[] { "Scale=4" });
+        var mixed = PetSettings.Load(partial);
+        Check("missing SfxMode key uses the new default", mixed.SfxMode == 1);
+        Check("missing RespawnReversalEnabled key uses the new default", mixed.RespawnReversalEnabled);
+        Check("missing IgnoreMaximizedWindows key uses the new default", mixed.IgnoreMaximizedWindows);
+
+        Console.WriteLine();
+        Console.WriteLine("  Celeste folder");
+        string celeste = Path.Combine(dir, "celeste.txt");
+        var pointed = PetSettings.Load(celeste);
+        Check("no folder is remembered until one is found or chosen", pointed.CelestePath == "");
+        pointed.CelestePath = @"C:\Games\Celeste";
+        pointed.Save();
+        Check("the chosen folder survives a restart",
+            PetSettings.Load(celeste).CelestePath == @"C:\Games\Celeste");
+
+        string wasChosen = CelesteInstall.Chosen;
+        string wasEnvironment = Environment.GetEnvironmentVariable("CELESTE_PATH");
+        try
+        {
+            // What follows is about the setting, and CELESTE_PATH outranks it by design --
+            // Program sets that from celeste-path.txt, so it has to come off first. Pinning
+            // the order it outranks in is the last check here.
+            Environment.SetEnvironmentVariable("CELESTE_PATH", null);
+            CelesteInstall.Chosen = null;
+            string real = CelesteInstall.Directory;
+            Check("a folder without Celeste.exe is not an install", !CelesteInstall.IsInstall(dir));
+            CelesteInstall.Chosen = dir;
+            Check("a remembered folder that no longer holds the game is not used",
+                CelesteInstall.Directory != dir);
+            if (real != null)
+            {
+                CelesteInstall.Chosen = real;
+                Check("the remembered folder is the one used", CelesteInstall.Directory == real);
+                Check("it is an install", CelesteInstall.IsInstall(real));
+                // The list of files an install must have is only right if a real one has them
+                // all: a typo in it would turn every install into a broken one.
+                Check("a real install is complete" +
+                    (CelesteInstall.IsComplete(real) ? "" :
+                        ", missing " + string.Join(", ", CelesteInstall.MissingFrom(real))),
+                    CelesteInstall.IsComplete(real));
+            }
+            else Console.WriteLine("    ..    no Celeste installed; the rest is untestable here");
+
+            // Celeste.exe and nothing else: a half-copied or half-deleted install, which used
+            // to pass for one and leave her with no sprites and no sound and nothing said.
+            string broken = Path.Combine(dir, "broken-install");
+            Directory.CreateDirectory(broken);
+            File.WriteAllText(Path.Combine(broken, "Celeste.exe"), "");
+            Check("a folder with only Celeste.exe is an install", CelesteInstall.IsInstall(broken));
+            Check("but not a complete one", !CelesteInstall.IsComplete(broken));
+            Check("and it says the atlas is what it is missing",
+                CelesteInstall.MissingFrom(broken).Contains(
+                    Path.Combine("Content", "Graphics", "Atlases", "Gameplay.meta")));
+            CelesteInstall.Chosen = broken;
+            Check("a broken one that was named is still the one used, so what is wrong with it " +
+                "can be said instead of another copy being used behind the user's back",
+                CelesteInstall.Directory == broken);
+
+            foreach (string file in new[]
+            {
+                @"Content\Graphics\Atlases\Gameplay.meta", @"Content\Graphics\Atlases\Gameplay0.data",
+                @"Content\FMOD\Desktop\Master Bank.bank", @"Content\FMOD\Desktop\Master Bank.strings.bank",
+                @"Content\FMOD\Desktop\sfx.bank", @"Content\FMOD\Desktop\dlc_sfx.bank",
+            })
+            {
+                string full = Path.Combine(broken, file);
+                Directory.CreateDirectory(Path.GetDirectoryName(full));
+                File.WriteAllText(full, "");
+            }
+            Check("filling in what it lacked makes it complete", CelesteInstall.IsComplete(broken));
+            CelesteInstall.Chosen = broken;
+            Check("and then it is the one used", CelesteInstall.Directory == broken);
+
+            if (real != null)
+            {
+                Environment.SetEnvironmentVariable("CELESTE_PATH", real);
+                CelesteInstall.Chosen = broken;   // also drops what was worked out before
+                Check("CELESTE_PATH outranks the setting", CelesteInstall.Directory == real);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CELESTE_PATH", wasEnvironment);
+            CelesteInstall.Chosen = wasChosen;
+        }
+
+        try { Directory.Delete(dir, true); } catch { }
+
+        Console.WriteLine();
+        Console.WriteLine("  Localization");
+        // Every key must exist in every language: a missing one shows up as an English word
+        // in the middle of a translated menu, and only when that menu is opened.
+        var english = (Dictionary<string, string>)typeof(Loc)
+            .GetField("english", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+        var translations = (Dictionary<string, Dictionary<string, string>>)typeof(Loc)
+            .GetField("translations", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+        foreach (var language in translations)
+        {
+            var missingKeys = new List<string>();
+            foreach (string key in english.Keys)
+                if (!language.Value.ContainsKey(key)) missingKeys.Add(key);
+            var extra = new List<string>();
+            foreach (string key in language.Value.Keys)
+                if (!english.ContainsKey(key)) extra.Add(key);
+            Check($"{language.Key} has every English key ({english.Count})" +
+                (missingKeys.Count == 0 ? "" : ", missing " + string.Join(", ", missingKeys)),
+                missingKeys.Count == 0);
+            Check($"{language.Key} has no key English lacks" +
+                (extra.Count == 0 ? "" : ", extra " + string.Join(", ", extra)), extra.Count == 0);
+        }
+
+        failed += SnapChecks.Run();
+        Console.WriteLine();
+        Console.WriteLine("  What counts as fullscreen, to step behind");
+        var monitor = new Rectangle(0, 0, 3840, 2160);
+        Check("a captionless window exactly on the monitor is fullscreen",
+            FullscreenAvoidance.IsFullscreen(new Rectangle(0, 0, 3840, 2160), false, monitor));
+        Check("a maximized window over an auto-hidden taskbar is not",
+            !FullscreenAvoidance.IsFullscreen(new Rectangle(-8, -8, 3856, 2176), true, monitor));
+        Check("a maximized window that dropped its caption is",
+            FullscreenAvoidance.IsFullscreen(new Rectangle(-8, -8, 3856, 2176), false, monitor));
+        Check("a window stopping short at the taskbar is not",
+            !FullscreenAvoidance.IsFullscreen(new Rectangle(0, 0, 3840, 2088), false, monitor));
+        Check("a window filling the monitor beside this one is not",
+            !FullscreenAvoidance.IsFullscreen(new Rectangle(3840, 0, 2560, 1440), false, monitor));
+
+        return failed;
+    }
+}

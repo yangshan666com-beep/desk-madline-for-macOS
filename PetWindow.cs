@@ -1,0 +1,5230 @@
+using System;
+using System.Xml.Linq;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Globalization;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace DeskMadeline
+{
+    /// <summary>
+    /// Desktop pet main window: layered transparent window + 60 FPS game loop + window-platform polling + tray menu.
+    /// All desktop coordinates are physical pixels (process is PerMonitorV2); physics runs in game-pixel space (1 game px = S physical px).
+    /// </summary>
+    public partial class PetWindow : Form
+    {
+        // ===== Tunable parameters =====
+        public int GameScale = 6;               // integer nearest-neighbor scale (vanilla 1080p is 6x)
+        public bool InputEnabled = true;
+        public bool PadInputEnabled = true;
+        public bool InputWhenUnfocused;
+        public bool AlwaysOnTop = true;
+        public static PetWindow Instance;
+
+        // Keep a symmetric world-space envelope around the player. Particles stay
+        // where they were emitted while the camera follows Madeline; the former
+        // 160px-tall strip clipped dash/Elytra particles after fast vertical moves.
+        // 1024px retains the same one-second ultra envelope on both axes.
+        const int CanvasW = 1024, CanvasH = 1024;
+        const float AnchorX = 512, AnchorY = 512; // foot anchor (inside the canvas)
+        const double FixedDt = 1.0 / 60.0;
+        static readonly IntPtr FloorId = new IntPtr(-991);
+        const int WindowBorderPx = 8;           // hollow window-border thickness (physical pixels)
+        // SpaceController's margins, the end of Core: past the bottom by 12, past the top by 4.
+        const float SpaceWrapBottom = 12f, SpaceWrapTop = 4f;
+        // It wraps only up and down. Across uses its top's 4 on both sides -- a desktop
+        // adaptation: her hitbox that far past a side has her sprite off the screen.
+        const float EdgeWrapSide = 4f;
+        const float MaxWrapOvershoot = 20f;     // farther past a threshold than a frame's run is a drop, not a run
+
+        readonly Player player = new Player();
+        readonly KeyBindings bindings;
+        readonly PadBindings padBindings;
+        readonly PetSettings settings;
+        readonly SoundEffects soundEffects;
+        internal readonly SkinManager skinManager;
+        // GFX.SpriteBank: the game's Sprites.xml, with a skin's laid over it.
+        SpriteBank spriteBank;
+        // Player.sweatSprite: player_sweat, its own sprite drawn over hers.
+        readonly GameSprite sweatSprite = new GameSprite();
+        readonly NotifyIcon tray;
+        // No sprites to draw her from: the tray offers only what still matters then.
+        bool withoutMadeline;
+
+        Thread loopThread;
+        volatile bool running;
+        int pendingScale = -1;
+        volatile string pendingSkinId;
+        int pendingGliderSpawns;
+        int pendingTheoSpawns;
+        int pendingSeekerSpawns;
+        int pendingBumperSpawns;
+        int pendingPufferSpawns;
+        int pendingRemoveAllEntities;
+        readonly Queue<Glider> pendingGliderRemovals = new Queue<Glider>();
+        readonly Queue<TheoCrystal> pendingTheoRemovals = new Queue<TheoCrystal>();
+        readonly Queue<Seeker> pendingSeekerRemovals = new Queue<Seeker>();
+        readonly Queue<Bumper> pendingBumperRemovals = new Queue<Bumper>();
+        readonly Queue<Puffer> pendingPufferRemovals = new Queue<Puffer>();
+        bool introWakeUp = true;   // On startup play the wake-up animation (wakeUp 00-14), then switch to idle
+
+        // Rendering
+        GameCanvas canvas;      // 1x game-pixel buffer (CanvasW x CanvasH); draw at integer coords then integer upscale
+        readonly TrailStamp[] trailStamps = new TrailStamp[1024];
+        D3DPresenter presenter;
+        CompositionHost compositionHost;
+        readonly Rectangle virtualDesktop;
+        int renderFrameCount;
+
+        // Platforms
+        readonly Dictionary<IntPtr, Win32.RECT> lastRects = new Dictionary<IntPtr, Win32.RECT>();
+        int pollCounter;
+
+        // Input state
+        PadState prevPad;
+        // Idle autonomy: the director plays her through the same PetInput the keyboard fills.
+        readonly IdleDirector idleDirector = new IdleDirector(new Random());
+        IdleDebugWindow idleDebugWindow;
+        public volatile bool IdleDebugWanted;
+        public volatile string IdleDebugText = "";
+        public bool IdleAutonomyEnabled;
+        bool realInputThisFrame;
+        // Input.GrabCheck as the player's hands gave it this frame, read before UpdateGrab.
+        readonly GrabInput grabInput = new GrabInput();
+        readonly GrabbyIcon grabbyIcon = new GrabbyIcon();
+        bool grabCheck;
+        bool wakeUpPending;
+        volatile bool foregroundFullscreen;   // also read by the sound hush
+        readonly List<KeyValuePair<IntPtr, RectangleF>> idleWindowsScratch
+            = new List<KeyValuePair<IntPtr, RectangleF>>();
+        // Celeste's MoveX, MoveY, GliderMoveY, Aim and Feather, each its own virtual input.
+        readonly IntegerAxis moveX = new IntegerAxis(), moveY = new IntegerAxis();
+        readonly IntegerAxis gliderMoveY = new IntegerAxis();
+        readonly IntegerAxis aimX = new IntegerAxis(), aimY = new IntegerAxis();
+        readonly IntegerAxis featherX = new IntegerAxis(), featherY = new IntegerAxis();
+
+        // Dragging
+        volatile bool dragging;
+        Point dragGrabOffset;      // physical pixels: grab point relative to feet
+        PointF cursorVel;          // physical pixels / second
+        Point lastCursor;
+        /// <summary>
+        /// How opaque an input-only window is: one 255th, the least Windows will still send a
+        /// click to. These windows exist to be clicked and dragged and are never meant to be
+        /// seen, but a layered window at alpha 0 is hit-tested straight through, so they cannot
+        /// be nothing at all. At 1 the box around her darkens whatever is behind it by a single
+        /// level -- 255 becomes 254 -- which is the smallest mark it is possible to leave.
+        /// The value is picked to land on 1 after WinForms multiplies it by 255 and truncates.
+        /// </summary>
+        internal const double HitTestOpacity = 1.4 / 255.0;
+
+        byte[] playerHitMask;      // the shape the input window was last cut down to
+        IntPtr trayIconHandle;     // tray icon HICON (must DestroyIcon explicitly)
+        bool restartAfterExit;     // start a fresh copy once this one has let go of everything
+
+        // Particles / effects
+        readonly ParticleSystem particles = new ParticleSystem();
+        readonly ParticleSystem seekerParticles = new ParticleSystem();
+        PType bumperLaunch, bumperAmbience;
+        PType kevinActivate, kevinCrushing, kevinImpact;
+        readonly Random bumperSparkle = new Random();
+        readonly Random pufferSparkle = new Random();
+        readonly Dictionary<int, Bitmap> seekerParticleBitmaps = new Dictionary<int, Bitmap>();
+        Bitmap gliderDebugStamp, theoDebugStamp;
+        readonly Bitmap[] seekerDebugStamps = new Bitmap[3];
+        readonly List<WaveRing> waveRings = new List<WaveRing>();
+        readonly Random effectRng = new Random();
+        PType dust, dashBlue, dashRed, dashBadeline, elytraDeploy;
+        PType seekerAttack, seekerHitWall, seekerStomp, seekerRegen, theoImpact;
+        bool ParticlesEnabled = true;    // particle effects toggle (on by default; tray menu can disable)
+        float skidDustTimer;
+        int observedPushDustCount;
+        bool soundDucking;
+        int observedLaunchCount;
+        int observedRingDashSequenceCount;
+        int observedWallJumpEffectCount;
+        int observedJumpEffectCount;
+        int observedLandingEffectCount;
+        int observedElytraDeployCount;
+        int observedExplodeLaunchCount;
+        int observedSweatAnimSequenceCount;
+        bool speedRingLaunchActive;
+        float speedRingLaunchTimer;
+        float nextSpeedRingTime;
+        float dashParticleTimer;
+        float tiredFlashTimer;
+        bool tiredFlash;
+        readonly List<DashTrail> dashTrails = new List<DashTrail>();
+        SlashVisual slash;
+        /// <summary>The slash, turned to face each way a dash can go. See GetSlashStamp.</summary>
+        const int SlashStampSize = 32;   // 24x8 rotated needs 26; even, so its edges land on the grid
+        readonly Dictionary<int, Bitmap> slashStamps = new Dictionary<int, Bitmap>();
+        int observedDashSequenceCount;
+        bool dashVisualPending;
+        float dashVisualTimer = -1f;
+        int dashTrailStage;
+        float dreamTrailTimer;
+        const int CatTailCount = 8;
+        readonly PointF[] catTailNodes = new PointF[CatTailCount];
+        readonly Color[] customHairColors = new Color[3];
+        readonly Queue<int> speedometerSamples = new Queue<int>(10);
+        bool catTailStarted;
+        bool catTailEnabled, catBangsEnabled, customHairColorsEnabled;
+        int speedometerMode;
+        bool hitboxesEnabled;
+        // What the windows are made of: solid ledges, dream blocks, or water.
+        const int WindowsSolid = 0, WindowsDream = 1, WindowsWater = 2, WindowsMoon = 3,
+            WindowsKevin = 4;
+        int windowMode;
+        bool dreamBlockMode => windowMode == WindowsDream;
+        bool waterMode => windowMode == WindowsWater;
+        /// <summary>Moon blocks are ordinary window borders that will not hold still.</summary>
+        bool moonMode => windowMode == WindowsMoon;
+        bool kevinMode => windowMode == WindowsKevin;
+        readonly MoonWindows moonWindows = new MoonWindows();
+        readonly KevinWindows kevinWindows = new KevinWindows();
+        volatile bool ignoreMaximizedWindows;   // read by the poll on the game-loop thread
+        int edgeWrapMode;
+        bool edgeWrapOneMonitor;                // wrap around the monitor she is on, not all of them
+        RectangleF confinedMonitor;             // that monitor in game pixels, while it applies
+        readonly List<RectangleF> monitorGameBounds = new List<RectangleF>();
+        readonly Bitmap[] picoDigits = new Bitmap[10];
+        readonly List<Glider> gliders = new List<Glider>();
+        readonly List<IPetHoldable> holdables = new List<IPetHoldable>();
+        readonly object gliderWindowLock = new object();
+        readonly Dictionary<Glider, JellyInputWindow> gliderWindows = new Dictionary<Glider, JellyInputWindow>();
+        readonly Dictionary<Glider, GliderStampCache> gliderStampCache = new Dictionary<Glider, GliderStampCache>();
+        readonly List<TheoCrystal> theos = new List<TheoCrystal>();
+        readonly object theoWindowLock = new object();
+        readonly Dictionary<TheoCrystal, TheoInputWindow> theoWindows = new Dictionary<TheoCrystal, TheoInputWindow>();
+        readonly List<Seeker> seekers = new List<Seeker>();
+        readonly object seekerWindowLock = new object();
+        readonly Dictionary<Seeker, SeekerInputWindow> seekerWindows = new Dictionary<Seeker, SeekerInputWindow>();
+        readonly Dictionary<Seeker, GliderStampCache> seekerStampCache = new Dictionary<Seeker, GliderStampCache>();
+        readonly List<Bumper> bumpers = new List<Bumper>();
+        readonly object bumperWindowLock = new object();
+        readonly Dictionary<Bumper, BumperInputWindow> bumperWindows = new Dictionary<Bumper, BumperInputWindow>();
+        readonly Dictionary<Bumper, GliderStampCache> bumperStampCache = new Dictionary<Bumper, GliderStampCache>();
+        readonly List<Puffer> puffers = new List<Puffer>();
+        readonly object pufferWindowLock = new object();
+        readonly Dictionary<Puffer, PufferInputWindow> pufferWindows = new Dictionary<Puffer, PufferInputWindow>();
+        readonly Dictionary<Puffer, GliderStampCache> pufferStampCache = new Dictionary<Puffer, GliderStampCache>();
+        Glider draggedGlider;
+        PointF gliderDragOffset, gliderCursorVelocity;
+        Point lastGliderCursor;
+        TheoCrystal draggedTheo;
+        PointF theoDragOffset, theoCursorVelocity;
+        Point lastTheoCursor;
+        Seeker draggedSeeker;
+        PointF seekerDragOffset, seekerCursorVelocity;
+        Point lastSeekerCursor;
+        // A bumper is put somewhere rather than thrown, so the drag keeps no speed for it.
+        Bumper draggedBumper;
+        PointF bumperDragOffset;
+        Puffer draggedPuffer;
+        PointF pufferDragOffset;
+        bool seekerRespawnDormant, observedPlayerRespawning;
+
+        sealed class GliderStampCache
+        {
+            public string FrameId;
+            public int Rotation, ScaleX, ScaleY;
+            public Bitmap Bitmap;
+        }
+
+        struct WaveRing
+        {
+            public float X, Y, Angle, Progress;
+        }
+
+        sealed class DashTrail
+        {
+            public float X, Y, ScaleX, ScaleY, Age;
+            public int Facing;
+            public string FrameId;
+            public Color Tint, HairColor;
+            public HairPlan Hair;
+            public PointF[] CatTailNodes;
+            public Bitmap Mask;
+        }
+
+        struct SlashVisual
+        {
+            public bool Active;
+            public float X, Y, Angle, Age;
+        }
+
+        public PetWindow()
+        {
+            Instance = this;
+            // Solid.OnDashCollide, answered by whichever window mode is on: a moon window
+            // takes its shove and collides as normal, a kevin window charges and throws her
+            // back, and any other window is just a wall.
+            player.OnDashCollide = (id, direction) =>
+            {
+                if (moonMode)
+                {
+                    moonWindows.Dashed(id, direction);
+                    return DashCollisionResults.NormalOverride;
+                }
+                if (kevinMode) return kevinWindows.Dashed(id, direction);
+                return DashCollisionResults.NormalCollision;
+            };
+            settings = PetSettings.Load(System.IO.Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "settings.txt"));
+            virtualDesktop = GetVirtualDesktopBounds();
+            GameScale = settings.Scale;
+            InputEnabled = settings.InputEnabled;
+            PadInputEnabled = settings.PadInputEnabled;
+            InputWhenUnfocused = settings.InputWhenUnfocused;
+            IdleAutonomyEnabled = settings.IdleAutonomy;
+            AlwaysOnTop = settings.AlwaysOnTop;
+            ParticlesEnabled = settings.ParticlesEnabled;
+            catTailEnabled = settings.CatTailEnabled;
+            catBangsEnabled = settings.CatBangsEnabled;
+            customHairColorsEnabled = settings.CustomHairColorsEnabled;
+            customHairColors[0] = Rgb(settings.HairColor0);
+            customHairColors[1] = Rgb(settings.HairColor1);
+            customHairColors[2] = Rgb(settings.HairColor2);
+            speedometerMode = settings.SpeedometerMode;
+            hitboxesEnabled = settings.HitboxesEnabled;
+            windowMode = settings.WindowMode;
+            ignoreMaximizedWindows = settings.IgnoreMaximizedWindows;
+            avoidFullscreen = settings.AvoidFullscreen;
+            edgeWrapMode = settings.EdgeWrapMode;
+            edgeWrapOneMonitor = settings.EdgeWrapOneMonitor;
+            player.ElytraEnabled = settings.ElytraEnabled;
+            player.SetFreezeFramesEnabled(settings.FreezeFramesEnabled);
+            player.RespawnReversalEnabled = settings.RespawnReversalEnabled;
+            player.InfiniteStamina = settings.InfiniteStamina;
+            player.Invincible = settings.Invincible;
+            player.SuperDashing = settings.SuperDashing;
+            player.SetDashMode(settings.DashMode);
+            grabInput.SetMode((GrabModes)settings.GrabMode);
+            flyoutTab = settings.FlyoutTab;
+            FlyoutPalette.Theme = settings.Theme;
+            foreach (string key in settings.FlyoutOpen.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                flyoutOpen.Add(key.Trim());
+            player.NormalSurfaceSoundIndex = settings.SurfaceSoundIndex;
+            player.Holdables = holdables;
+            Loc.SetLanguage(Loc.DetectDefault(settings.Language));
+            // Both the sounds below and the sprites further down are read out of Celeste, so
+            // where it is has to be settled before either of them looks.
+            ResolveCelesteInstall();
+            soundEffects = new SoundEffects(
+                () => IsPetInputWindow(Win32.GetForegroundWindow()),
+                // Nothing of hers over a game's or a film's own sound, in any mode.
+                () => avoidFullscreen && foregroundFullscreen,
+                settings.SfxMode, settings.SfxVolume);
+            bindings = new KeyBindings(System.IO.Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "keybindings.txt"));
+            padBindings = new PadBindings(System.IO.Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory, "padbindings.txt"));
+            // Cap log growth: rewrite when over 5MB (keeps the latest run)
+            try
+            {
+                var logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pet_debug.log");
+                if (new System.IO.FileInfo(logPath).Length > 5 * 1024 * 1024)
+                    System.IO.File.WriteAllText(logPath, "");
+            }
+            catch { }
+            // ---- Window style: borderless, no taskbar entry, DirectComposition transparency ----
+            FormBorderStyle = FormBorderStyle.None;
+            Text = "Desk Madeline";
+            // Layered-canvas size is controlled explicitly by GameScale; do not let WinForms
+            // re-scale it again on WM_DPICHANGED via font DPI.
+            AutoScaleMode = AutoScaleMode.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            // Note: do not set BackColor/TransparencyKey (color-key layering conflicts with ULW)
+            Size = new Size(24 * GameScale, 33 * GameScale);
+            Location = new Point(-10000, -10000);
+            BackColor = Color.Black;
+            Opacity = HitTestOpacity;
+
+            // ---- Sprites and animations ----
+            skinManager = new SkinManager(AppDomain.CurrentDomain.BaseDirectory);
+            var initialSkin = skinManager.Find(settings.Skin);
+            skinManager.Activate(initialSkin);
+            Sprites.LoadAll(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "player"),
+                initialSkin?.GameplayDirectory);
+            try
+            {
+                // Shipped beside the app, or read from the same atlas the sprites came from.
+                string fontFile = System.IO.Path.Combine(
+                    AppDomain.CurrentDomain.BaseDirectory, "assets", "pico8font.png");
+                using var fontSource = System.IO.File.Exists(fontFile)
+                    ? new Bitmap(fontFile)
+                    : Sprites.Get("pico8/font", false) is Bitmap atlasFont
+                        ? new Bitmap(atlasFont)
+                        : throw new System.IO.FileNotFoundException(fontFile);
+                for (int digit = 0; digit < picoDigits.Length; digit++)
+                {
+                    int sourceX = digit < 4 ? 104 + digit * 4 : (digit - 4) * 4;
+                    int sourceY = digit < 4 ? 0 : 6;
+                    picoDigits[digit] = fontSource.Clone(
+                        new Rectangle(sourceX, sourceY, 3, 5), PixelFormat.Format32bppPArgb);
+                }
+            }
+            catch { }
+            dust = new PType
+            {
+                Tex = new[] { "smoke0", "smoke1", "smoke2", "smoke3" },
+                Color = Color.White,
+                GravY = 4f,
+                LifeMin = 0.3f, LifeMax = 0.5f,
+                // ParticleType.Size scales the 8x8 smoke texture by 0.7 ± 0.2.
+                Size = 5.6f, SizeRange = 1.6f,
+                SpeedMin = 5f, SpeedMax = 15f,
+                ScaleOut = true
+            };
+            dashBlue = new PType
+            {
+                Tex = new[] { "dashParticle" },
+                Color = Color.FromArgb(0x44, 0xB7, 0xFF),
+                Color2 = Color.FromArgb(0x75, 0xC9, 0xFF),
+                BlinkColor = true,
+                GravY = 8f,
+                LifeMin = 1f, LifeMax = 1.8f,
+                Size = 1f,
+                SpeedMin = 10f, SpeedMax = 20f,
+                LateFade = true
+            };
+            dashRed = new PType
+            {
+                Tex = new[] { "dashParticle" },
+                Color = Color.FromArgb(0xAC, 0x32, 0x32),
+                Color2 = Color.FromArgb(0xE0, 0x59, 0x59),
+                BlinkColor = true,
+                GravY = 8f,
+                LifeMin = 1f, LifeMax = 1.8f,
+                Size = 1f,
+                SpeedMin = 10f, SpeedMax = 20f,
+                LateFade = true
+            };
+            // ParticleTypes.cs: Player.P_DashBadB, used by
+            // PlayerSpriteMode.MadelineAsBadeline for a two-dash dash.
+            dashBadeline = new PType
+            {
+                Tex = new[] { "dashParticle" },
+                Color = Color.FromArgb(0x9B, 0x3F, 0xB5),
+                Color2 = Color.FromArgb(0xCC, 0x8E, 0xE2),
+                BlinkColor = true,
+                GravY = 8f,
+                LifeMin = 1f, LifeMax = 1.8f,
+                Size = 1f,
+                SpeedMin = 10f, SpeedMax = 20f,
+                LateFade = true
+            };
+            elytraDeploy = new PType
+            {
+                Tex = new[] { "smoke0", "smoke1", "smoke2", "smoke3" },
+                Color = Color.White,
+                Color2 = Color.LightGray,
+                ChooseColor = true,
+                GravY = 1f,
+                LifeMin = 1f, LifeMax = 3f,
+                // The source texture is 8px and the mod uses scale 1 +/- 0.4.
+                Size = 8f, SizeRange = 3.2f,
+                SpeedMin = 10f, SpeedMax = 60f,
+                ScaleOut = true,
+                FadeOut = false
+            };
+            seekerAttack = new PType
+            {
+                Tex = new[] { "dashParticle" }, Color = Color.FromArgb(0x99, 0xE5, 0x50),
+                Color2 = Color.FromArgb(0xDD, 0xFF, 0xBC), BlinkColor = true,
+                LifeMin = .6f, LifeMax = 1.2f, Size = 1f,
+                SpeedMin = 20f, SpeedMax = 40f, SpeedMultiplier = .4f, LateFade = true
+            };
+            seekerStomp = seekerAttack;
+            // Bumper.P_Launch and P_Ambience. The teal pair is the bumper's own; the rect is
+            // the four-by-two particles/rect the game draws them all with.
+            bumperLaunch = new PType
+            {
+                Tex = new[] { "rect" }, Color = Color.FromArgb(0x47, 0xB5, 0xCC),
+                Color2 = Color.FromArgb(0xC4, 0xF4, 0xFF), BlinkColor = true,
+                LifeMin = .6f, LifeMax = 1.2f, Size = .5f, SizeRange = .2f,
+                SpeedMin = 40f, SpeedMax = 140f, SpeedMultiplier = .1f,
+                GravY = 10f, LateFade = true
+            };
+            bumperAmbience = new PType
+            {
+                Tex = new[] { "rect" }, Color = Color.FromArgb(0x47, 0xB5, 0xCC),
+                Color2 = Color.FromArgb(0xC4, 0xF4, 0xFF), BlinkColor = true,
+                LifeMin = .2f, LifeMax = .4f, Size = .5f, SizeRange = .2f,
+                SpeedMin = 10f, SpeedMax = 20f
+            };
+            // CrushBlock.P_Activate, P_Crushing and P_Impact. The first two are the same
+            // particles/rect the bumper's are; the impact is the dust smoke, slower and
+            // longer-lived than her footsteps kick it up.
+            kevinActivate = new PType
+            {
+                Tex = new[] { "rect" }, Color = Color.FromArgb(0x5F, 0xCD, 0xE4),
+                Color2 = Color.White, BlinkColor = true,
+                LifeMin = .5f, LifeMax = 1.1f, Size = .5f, SizeRange = .2f,
+                SpeedMin = 60f, SpeedMax = 100f, LateFade = true
+            };
+            kevinCrushing = new PType
+            {
+                Tex = new[] { "rect" }, Color = Color.FromArgb(0xFF, 0x66, 0xE2),
+                Color2 = Color.FromArgb(0x68, 0xFC, 0xFF), BlinkColor = true,
+                LifeMin = .5f, LifeMax = 1.2f, Size = .5f, SizeRange = .2f,
+                SpeedMin = 30f, SpeedMax = 50f, LateFade = true
+            };
+            kevinImpact = new PType
+            {
+                Tex = new[] { "smoke0", "smoke1", "smoke2", "smoke3" },
+                Color = Color.White, GravY = 4f,
+                LifeMin = .8f, LifeMax = 1.6f,
+                // The same x8 texture-scale conversion the footstep dust documents.
+                Size = 9.6f, SizeRange = 4f,
+                SpeedMin = 8f, SpeedMax = 12f, ScaleOut = true
+            };
+            seekerHitWall = new PType
+            {
+                Tex = new[] { "dashParticle" }, Color = Color.FromArgb(0x99, 0xE5, 0x50),
+                Color2 = Color.FromArgb(0xDD, 0xFF, 0xBC), BlinkColor = true,
+                LifeMin = .6f, LifeMax = 1.2f, Size = 1f,
+                SpeedMin = 30f, SpeedMax = 60f, SpeedMultiplier = .4f, LateFade = true
+            };
+            seekerRegen = new PType
+            {
+                Tex = new[] { "dashParticle" }, Color = Color.FromArgb(0xCB, 0xDB, 0xFC),
+                Color2 = Color.FromArgb(0x57, 0x5F, 0xD9), BlinkColor = true,
+                LifeMin = .4f, LifeMax = 1.2f, Size = 1f,
+                SpeedMin = 20f, SpeedMax = 100f, SpeedMultiplier = .4f, LateFade = true
+            };
+            // ParticleTypes.cs: TheoCrystal.P_Impact.
+            theoImpact = new PType
+            {
+                Tex = new[] { "dashParticle" }, Color = Color.FromArgb(0xCB, 0xDB, 0xFC),
+                LifeMin = .3f, LifeMax = .8f, Size = 1f,
+                SpeedMin = 10f, SpeedMax = 20f, SpeedMultiplier = .1f, LateFade = true
+            };
+            ApplySpriteBank();
+            player.Sprite.Play("wakeUp");   // Play wake-up animation on startup
+
+            // ---- Spawn point: bottom-center of primary working area ----
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            player.Pos = new PointF(ToGamePixels((wa.Left + wa.Right) / 2), ToGamePixels(wa.Bottom) - 2);
+
+            // ---- Tray ----
+            // With her sprites, both right-clicks -- on her and on the tray icon -- open the
+            // flyout; without them there is nothing for it to be about, and the tray keeps a
+            // plain menu of the two things that still matter.
+            withoutMadeline = Sprites.LoadedFromCeleste == 0;
+            tray = new NotifyIcon
+            {
+                Text = Loc.T("App.Name"),
+                Icon = BuildTrayIcon(),
+                Visible = true
+            };
+            tray.MouseUp += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Right && e.Button != MouseButtons.Left) return;
+                if (withoutMadeline) ShowFallbackMenu(Cursor.Position);
+                else OpenFlyout(Cursor.Position);
+            };
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                const int WS_EX_TOPMOST = 0x00000008;
+                var cp = base.CreateParams;
+                // Keep tool-window style (hidden from Alt+Tab/taskbar) but allow activation: after clicking Madeline
+                // she takes keyboard focus so movement keys are not also typed into other apps.
+                cp.ExStyle |= Win32.WS_EX_LAYERED | Win32.WS_EX_TOOLWINDOW;
+                if (AlwaysOnTop) cp.ExStyle |= WS_EX_TOPMOST;
+                return cp;
+            }
+        }
+
+        static Rectangle GetVirtualDesktopBounds()
+        {
+            int left = int.MaxValue, top = int.MaxValue;
+            int right = int.MinValue, bottom = int.MinValue;
+            foreach (var screen in Screen.AllScreens)
+            {
+                left = Math.Min(left, screen.Bounds.Left);
+                top = Math.Min(top, screen.Bounds.Top);
+                right = Math.Max(right, screen.Bounds.Right);
+                bottom = Math.Max(bottom, screen.Bounds.Bottom);
+            }
+            return left == int.MaxValue
+                ? new Rectangle(0, 0, 1920, 1080)
+                : Rectangle.FromLTRB(left, top, right, bottom);
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            compositionHost = new CompositionHost(virtualDesktop, AlwaysOnTop);
+            compositionHost.Show();
+            compositionHostHandle = compositionHost.Handle;
+            presenter = new D3DPresenter(compositionHost.Handle, CanvasW, CanvasH, GameScale, virtualDesktop);
+            Win32.SetWindowPos(Handle, AlwaysOnTop ? Win32.HWND_TOPMOST : Win32.HWND_NOTOPMOST,
+                0, 0, 0, 0, Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOACTIVATE);
+            EnumerateWindows();
+            RebuildSolids(1f / 60f);
+            player.Hair.Reset(new PointF(player.Pos.X, player.Pos.Y - 9), player.Facing);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            // Start the game loop only after the window is really shown (DirectComposition target needs a ready HWND)
+            running = true;
+            loopThread = new Thread(GameLoop) { IsBackground = true, Name = "PetLoop" };
+            loopThread.Start();
+            OfferSoundRuntime();
+        }
+
+        /// <summary>
+        /// A copy of Celeste with no FMOD the pet can load, asked about once and then left
+        /// alone. Here rather than in the constructor because it is a dialog, and one that
+        /// fetches: it wants a window that exists to come back to, and she may as well be on
+        /// the desktop moving about while it is up.
+        /// </summary>
+        void OfferSoundRuntime()
+        {
+            if (settings.SfxRuntimeAsked || soundEffects.Available) return;
+            if (soundEffects.Trouble != "Sfx.WhyNoRuntime" || !FmodDownload.Wanted) return;
+            settings.SfxRuntimeAsked = true;
+            SaveSettings();
+            FmodDownload.Ask(this, () => { restartAfterExit = true; ExitApp(); });
+        }
+
+        // ================= The sprite bank =================
+        /// <summary>
+        /// GFX.SpriteBank, for her: the game's Sprites.xml with the worn skin's merged into it the way
+        /// Everest merges a mod's, its player sprites' frame metadata, and then the entry she wears
+        /// put onto her sprite -- PlayerSprite's constructor, through SkinModHelper's hook on it --
+        /// with player_sweat, or the skin's reskin of it, onto the sweat's.
+        /// </summary>
+        void ApplySpriteBank()
+        {
+            SkinDefinition skin = skinManager.Active;
+            string xml = CelesteInstall.GraphicsFile("Sprites.xml");
+            spriteBank = null;
+            if (xml != null)
+            {
+                var mods = new List<XDocument>();
+                string modXml = skin?.GameplayDirectory == null ? null
+                    : System.IO.Path.Combine(System.IO.Path.GetDirectoryName(System.IO.Path.GetDirectoryName(skin.GameplayDirectory)), "Sprites.xml");
+                try
+                {
+                    if (modXml != null && System.IO.File.Exists(modXml)) mods.Add(XDocument.Load(modXml));
+                    spriteBank = SpriteBank.Load(Sprites.Atlas, XDocument.Load(xml), mods);
+                }
+                catch (Exception ex) { Log("sprite bank unreadable: " + ex.Message); }
+            }
+            if (spriteBank != null)
+                foreach (string failure in spriteBank.Failures)
+                    if (failure.StartsWith("player", StringComparison.OrdinalIgnoreCase)) Log("sprite bank: " + failure);
+            HairMeta.LoadPlayerSprites(spriteBank, Sprites.Atlas);
+
+            string spriteName = "player";
+            int mode = Player.ModeMadeline;
+            SmhSkin smh = null;
+            string sweat = "player_sweat";
+            if (spriteBank != null && skin != null)
+            {
+                switch (skin.Kind)
+                {
+                    // Play As Badeline: the game's own player_badeline.
+                    case SkinKind.Builtin when skinManager.IsBadeline:
+                        spriteName = "player_badeline";
+                        mode = Player.ModeMadelineAsBadeline;
+                        break;
+                    case SkinKind.SkinModHelper when spriteBank.Has(skin.CharacterId):
+                        // RespriteBank_Reload: the skin's sprite gets its metadata, then the
+                        // sprites its OtherSprite_Path reskins are combined in, under the player's
+                        // cipher.
+                        HairMeta.AddCommunalHelperElytra(spriteBank, skin.CharacterId, Sprites.Atlas);
+                        HairMeta.CreateFramesMetadata(spriteBank, skin.CharacterId, Sprites.Atlas);
+                        HairMeta.AddCommunalHelperMetadata(spriteBank, skin.CharacterId, Sprites.Atlas);
+                        CombineReskins(skin.OtherSpritePath, skin.SkinName + Smh.PlayerCipher);
+                        spriteName = skin.CharacterId;
+                        mode = skin.Mode;
+                        smh = new SmhSkin(spriteBank, Sprites.Atlas, spriteName, skin.SkinName, mode,
+                            skin.GameplayDirectory, null, null);
+                        if (spriteBank.Has(sweat + skin.SkinName + Smh.PlayerCipher)) sweat += skin.SkinName + Smh.PlayerCipher;
+                        break;
+                    case SkinKind.SkinModHelperOld:
+                        CombineReskins(skin.OldExPath, skin.SkinName);
+                        if (spriteBank.Has("player" + skin.SkinName)) spriteName = "player" + skin.SkinName;
+                        smh = new SmhSkin(spriteBank, Sprites.Atlas, spriteName, skin.SkinName, mode,
+                            skin.GameplayDirectory, skin.OldConfig, skin.OldExPath);
+                        if (spriteBank.Has(sweat + skin.SkinName)) sweat += skin.SkinName;
+                        break;
+                    // A mod that only replaces the game's textures: the game's player sprite over
+                    // them, with SkinModHelper's hooks reading whatever skinConfig it brings.
+                    case SkinKind.Replacement:
+                        smh = new SmhSkin(spriteBank, Sprites.Atlas, spriteName, null, mode,
+                            skin.GameplayDirectory, null, null);
+                        break;
+                }
+            }
+            player.ResetSprite(spriteBank, spriteName, mode, smh);
+            if (spriteBank != null && spriteBank.Has(sweat)) spriteBank.CreateOn(sweatSprite, sweat);
+            ApplyParticleModify();
+        }
+
+        // CharacterConfig.ParticleModify: the particle types she emits, as her skin modifies them.
+        readonly Dictionary<PType, PType> skinnedParticles = new Dictionary<PType, PType>();
+        readonly Dictionary<(PType, int, int), PType> recoloredParticles = new Dictionary<(PType, int, int), PType>();
+
+        /// <summary>ParticleReplace: the skin's version of a type, for a particle she emits.</summary>
+        PType SkinnedParticle(PType type) => skinnedParticles.TryGetValue(type, out PType skinned) ? skinned : type;
+
+        /// <summary>A copy of a type in other colours: _pDashParticle's new(orig) with Color and Color2.</summary>
+        PType WithColors(PType type, Color color, Color color2)
+        {
+            var key = (type, color.ToArgb(), color2.ToArgb());
+            if (recoloredParticles.TryGetValue(key, out PType done)) return done;
+            PType copy = Clone(type);
+            copy.Color = color;
+            copy.Color2 = color2;
+            return recoloredParticles[key] = copy;
+        }
+
+        static PType Clone(PType t) => new PType
+        {
+            Tex = t.Tex, Color = t.Color, Color2 = t.Color2, BlinkColor = t.BlinkColor, ChooseColor = t.ChooseColor,
+            GravY = t.GravY, Friction = t.Friction, LifeMin = t.LifeMin, LifeMax = t.LifeMax, Size = t.Size,
+            SizeRange = t.SizeRange, SpeedMin = t.SpeedMin, SpeedMax = t.SpeedMax, SpeedMultiplier = t.SpeedMultiplier,
+            ScaleOut = t.ScaleOut, FadeOut = t.FadeOut, LateFade = t.LateFade,
+        };
+
+        /// <summary>
+        /// ParticleModifierInit and NewParticleInit, for the static types the pet emits for her:
+        /// Player.P_DashA, P_DashB and P_DashBadB, and ParticleTypes.Dust. A field the pet's
+        /// particle has no counterpart for -- spin, rotation, an acceleration across, a fade or a
+        /// colour mode beyond the ones it draws -- has nothing to land on and is left alone.
+        /// </summary>
+        void ApplyParticleModify()
+        {
+            skinnedParticles.Clear();
+            recoloredParticles.Clear();
+            SmhSkin skin = player.Skin;
+            if (skin?.Character.ParticleModify == null) return;
+            foreach (SmhParticleModifier m in skin.Character.ParticleModify)
+            {
+                if (m.TargetFullName == null || !m.IsStatic) continue;
+                PType target = m.TargetFullName switch
+                {
+                    "Celeste.Player::P_DashA" => dashBlue,
+                    "Celeste.Player::P_DashB" => dashRed,
+                    "Celeste.Player::P_DashBadB" => dashBadeline,
+                    "Celeste.ParticleTypes::Dust" => dust,
+                    _ => null,
+                };
+                if (target == null) continue;
+                PType p = Clone(target);
+                if (m.Source != null && skin.TextureOnSprite(m.Source, out string source)) p.Tex = new[] { source };
+                else if (m.SourceChooser != null && m.SourceChooser.Count > 0 && m.SourceChooser[0] != "null")
+                {
+                    var chosen = new List<string>();
+                    foreach (string s in m.SourceChooser)
+                        if (skin.TextureOnSprite(s, out string tex)) chosen.Add(tex);
+                    if (chosen.Count > 0) p.Tex = chosen.ToArray();
+                }
+                if (Smh.RGBA_IsMatch(m.Color)) p.Color = Smh.HexToColorWithAlpha(m.Color);
+                if (Smh.RGBA_IsMatch(m.Color2)) p.Color2 = Smh.HexToColorWithAlpha(m.Color2);
+                // ParticleType.ColorModes: Static, Choose, Blink, Fade.
+                int colorMode = m.ColorMode == null ? -1 : ModeIndex(m.ColorMode, "Static", "Choose", "Blink", "Fade");
+                if (colorMode >= 0) { p.ChooseColor = colorMode == 1; p.BlinkColor = colorMode == 2; }
+                // ParticleType.FadeModes: None, Linear, Late, InAndOut.
+                int fadeMode = m.FadeMode == null ? -1 : ModeIndex(m.FadeMode, "None", "Linear", "Late", "InAndOut");
+                if (fadeMode >= 0) { p.FadeOut = fadeMode != 0; p.LateFade = fadeMode == 2; }
+                if (m.SpeedMin != null) p.SpeedMin = m.SpeedMin.Value;
+                if (m.SpeedMax != null) p.SpeedMax = m.SpeedMax.Value;
+                if (m.SpeedMultiplier != null) p.SpeedMultiplier = m.SpeedMultiplier.Value;
+                if (m.Acceleration != null)
+                {
+                    string[] a = m.Acceleration.Split(new[] { ',' }, 2);
+                    if (a.Length == 2 && float.TryParse(a[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float ay))
+                        p.GravY = ay;
+                }
+                if (m.Friction != null) p.Friction = m.Friction.Value;
+                if (m.LifeMin != null) p.LifeMin = m.LifeMin.Value;
+                if (m.LifeMax != null) p.LifeMax = m.LifeMax.Value;
+                if (m.Size != null) p.Size = m.Size.Value;
+                if (m.SizeRange != null) p.SizeRange = m.SizeRange.Value;
+                if (m.ScaleOut != null) p.ScaleOut = m.ScaleOut.Value;
+                skinnedParticles[target] = p;
+            }
+        }
+
+        static int ModeIndex(string value, params string[] names)
+        {
+            for (int i = 0; i < names.Length; i++)
+                if (names[i].Equals(value, StringComparison.OrdinalIgnoreCase)) return i;
+            return int.TryParse(value, out int n) ? n : -1;
+        }
+
+        /// <summary>
+        /// RespriteBankModule.DoCombine: a skin's Graphics/&lt;directory&gt;/Sprites.xml, read as a bank
+        /// of its own; each entry the game also has is added as that id plus the suffix, given the
+        /// game's animations it lacks, and its metadata when it brings some.
+        /// </summary>
+        void CombineReskins(string directory, string suffix)
+        {
+            SkinDefinition skin = skinManager.Active;
+            if (string.IsNullOrEmpty(directory) || skin?.GameplayDirectory == null) return;
+            string graphics = System.IO.Path.GetDirectoryName(System.IO.Path.GetDirectoryName(skin.GameplayDirectory));
+            string path = System.IO.Path.Combine(graphics, directory.Replace('/', System.IO.Path.DirectorySeparatorChar), "Sprites.xml");
+            if (!System.IO.File.Exists(path)) return;
+            SpriteBank reskins;
+            try { reskins = SpriteBank.Load(Sprites.Atlas, XDocument.Load(path), Array.Empty<XDocument>()); }
+            catch (Exception ex) { Log("skin reskins unreadable " + path + ": " + ex.Message); return; }
+            foreach (var entry in reskins.SpriteData)
+            {
+                if (!spriteBank.SpriteData.TryGetValue(entry.Key, out SpriteData original)) continue;
+                string id = entry.Key + suffix;
+                spriteBank.SpriteData[id] = entry.Value;
+                SmhSkin.PatchSprite(original.Sprite, entry.Value.Sprite);
+                if (entry.Value.Sources.Count > 0 && entry.Value.Sources[0].Xml.Element("Metadata") != null)
+                {
+                    HairMeta.AddCommunalHelperElytra(spriteBank, id, Sprites.Atlas);
+                    HairMeta.CreateFramesMetadata(spriteBank, id, Sprites.Atlas);
+                    HairMeta.AddCommunalHelperMetadata(spriteBank, id, Sprites.Atlas);
+                }
+            }
+        }
+
+        // ================= Game loop =================
+        void GameLoop()
+        {
+            Log("loop start");
+            TimePeriod.Begin(1);
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                double last = sw.Elapsed.TotalSeconds;
+                double acc = 0;
+
+                while (running)
+                {
+                    double now = sw.Elapsed.TotalSeconds;
+                    acc += now - last;
+                    last = now;
+                    if (acc > 0.1) acc = 0.1;
+
+                    bool stepped = false;
+                    while (acc >= FixedDt)
+                    {
+                        acc -= FixedDt;
+                        Tick((float)FixedDt);
+                        stepped = true;
+                    }
+                    if (stepped) Render();
+
+                    double sleepMs = (FixedDt - acc) * 1000 - 1;
+                    if (sleepMs > 1) Thread.Sleep((int)sleepMs);
+                    else Thread.SpinWait(2000);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("LOOP CRASH: " + ex);
+            }
+            finally
+            {
+                TimePeriod.End(1);   // Restore timer resolution even on exceptions
+            }
+        }
+
+        static readonly object logLock = new object();
+        public static void Log(string msg)
+        {
+            try
+            {
+                lock (logLock)
+                    System.IO.File.AppendAllText(
+                        System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "pet_debug.log"),
+                        DateTime.Now.ToString("HH:mm:ss.fff ") + msg + "\n");
+            }
+            catch { }
+        }
+
+        void Tick(float dt)
+        {
+            soundEffects.Update();
+            if (pendingSkinId != null)
+            {
+                string id = pendingSkinId;
+                var skin = skinManager.Find(id);
+                Sprites.LoadAll(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "player"),
+                    skin?.GameplayDirectory);
+                skinManager.Activate(skin);
+                // Only now: the flyout's picker shows the pending id until the skin is active, and
+                // clearing it before the load let a repaint meanwhile show the old skin's name.
+                // A pick made during the load stays pending for the next tick.
+                Interlocked.CompareExchange(ref pendingSkinId, null, id);
+                ApplySpriteBank();
+                settings.Skin = skin?.Id ?? SkinManager.DefaultId;
+                settings.Save();
+                Log("skin -> " + (skin?.DisplayName ?? "default"));
+            }
+
+            int spawnCount = Interlocked.Exchange(ref pendingGliderSpawns, 0);
+            for (int i = 0; i < spawnCount; i++)
+            {
+                // Spawn just above and in front of Madeline, as a normal unheld
+                // Glider actor rather than placing it directly in her pickup box.
+                var glider = new Glider(new PointF(
+                    player.Pos.X + player.Facing * (18f + i * 5f), player.Pos.Y - 16f));
+                gliders.Add(glider);
+                holdables.Add(glider);
+            }
+            if (spawnCount > 0 && IsHandleCreated)
+                BeginInvoke(new Action(EnsureGliderWindows));
+
+            int seekerSpawnCount = Interlocked.Exchange(ref pendingSeekerSpawns, 0);
+            for (int i = 0; i < seekerSpawnCount; i++)
+            {
+                PointF desired = new PointF(
+                    player.Pos.X + player.Facing * 48f, player.Pos.Y - 24f);
+                PointF? spawn = FindFreeSeekerSpawn(desired, player.Facing);
+                if (spawn.HasValue) seekers.Add(new Seeker(spawn.Value));
+            }
+            if (seekerSpawnCount > 0 && IsHandleCreated)
+                BeginInvoke(new Action(EnsureSeekerWindows));
+
+            int bumperSpawnCount = Interlocked.Exchange(ref pendingBumperSpawns, 0);
+            for (int i = 0; i < bumperSpawnCount; i++)
+                bumpers.Add(new Bumper(new PointF(
+                    player.Pos.X + player.Facing * (40f + i * 30f), player.Pos.Y - 20f)));
+            if (bumperSpawnCount > 0 && IsHandleCreated)
+                BeginInvoke(new Action(EnsureBumperWindows));
+
+            int pufferSpawnCount = Interlocked.Exchange(ref pendingPufferSpawns, 0);
+            for (int i = 0; i < pufferSpawnCount; i++)
+                puffers.Add(new Puffer(new PointF(
+                    player.Pos.X + player.Facing * (40f + i * 30f), player.Pos.Y - 20f),
+                    player.Facing > 0));
+            if (pufferSpawnCount > 0 && IsHandleCreated)
+                BeginInvoke(new Action(EnsurePufferWindows));
+
+            int theoSpawnCount = Interlocked.Exchange(ref pendingTheoSpawns, 0);
+            for (int i = 0; i < theoSpawnCount; i++)
+            {
+                var theo = new TheoCrystal(new PointF(
+                    player.Pos.X + player.Facing * (20f + i * 8f), player.Pos.Y - 12f));
+                theos.Add(theo);
+                holdables.Add(theo);
+            }
+            if (theoSpawnCount > 0 && IsHandleCreated)
+                BeginInvoke(new Action(EnsureTheoWindows));
+
+            int removeFlags = Interlocked.Exchange(ref pendingRemoveAllEntities, 0);
+            if ((removeFlags & 1) != 0)
+                lock (pendingGliderRemovals)
+                    foreach (Glider glider in gliders) pendingGliderRemovals.Enqueue(glider);
+            if ((removeFlags & 2) != 0)
+                lock (pendingSeekerRemovals)
+                    foreach (Seeker seeker in seekers) pendingSeekerRemovals.Enqueue(seeker);
+            if ((removeFlags & 4) != 0)
+                lock (pendingTheoRemovals)
+                    foreach (TheoCrystal theo in theos) pendingTheoRemovals.Enqueue(theo);
+            if ((removeFlags & 8) != 0)
+                lock (pendingBumperRemovals)
+                    foreach (Bumper bumper in bumpers) pendingBumperRemovals.Enqueue(bumper);
+            if ((removeFlags & 16) != 0)
+                lock (pendingPufferRemovals)
+                    foreach (Puffer puffer in puffers) pendingPufferRemovals.Enqueue(puffer);
+
+            lock (pendingGliderRemovals)
+            {
+                while (pendingGliderRemovals.Count > 0)
+                {
+                    Glider glider = pendingGliderRemovals.Dequeue();
+                    if (!gliders.Remove(glider)) continue;
+                    holdables.Remove(glider);
+                    player.ForgetHoldable(glider);
+                    if (draggedGlider == glider) draggedGlider = null;
+                    soundEffects.StopLoop(glider);
+                    if (gliderStampCache.TryGetValue(glider, out GliderStampCache cache))
+                    {
+                        cache.Bitmap?.Dispose();
+                        gliderStampCache.Remove(glider);
+                    }
+                    if (IsHandleCreated) BeginInvoke(new Action(() => CloseGliderWindow(glider)));
+                }
+            }
+
+            lock (pendingTheoRemovals)
+            {
+                while (pendingTheoRemovals.Count > 0)
+                {
+                    TheoCrystal theo = pendingTheoRemovals.Dequeue();
+                    if (!theos.Remove(theo)) continue;
+                    holdables.Remove(theo);
+                    player.ForgetHoldable(theo);
+                    if (draggedTheo == theo) draggedTheo = null;
+                    soundEffects.StopLoop(theo);
+                    if (IsHandleCreated) BeginInvoke(new Action(() => CloseTheoWindow(theo)));
+                }
+            }
+
+            lock (pendingPufferRemovals)
+            {
+                while (pendingPufferRemovals.Count > 0)
+                {
+                    Puffer puffer = pendingPufferRemovals.Dequeue();
+                    if (!puffers.Remove(puffer)) continue;
+                    if (draggedPuffer == puffer) draggedPuffer = null;
+                    if (pufferStampCache.TryGetValue(puffer, out GliderStampCache pufferCache))
+                    {
+                        pufferCache.Bitmap?.Dispose();
+                        pufferStampCache.Remove(puffer);
+                    }
+                    if (IsHandleCreated) BeginInvoke(new Action(() => ClosePufferWindow(puffer)));
+                }
+            }
+
+            lock (pendingBumperRemovals)
+            {
+                while (pendingBumperRemovals.Count > 0)
+                {
+                    Bumper bumper = pendingBumperRemovals.Dequeue();
+                    if (!bumpers.Remove(bumper)) continue;
+                    if (draggedBumper == bumper) draggedBumper = null;
+                    if (bumperStampCache.TryGetValue(bumper, out GliderStampCache bumperCache))
+                    {
+                        bumperCache.Bitmap?.Dispose();
+                        bumperStampCache.Remove(bumper);
+                    }
+                    if (IsHandleCreated) BeginInvoke(new Action(() => CloseBumperWindow(bumper)));
+                }
+            }
+
+            lock (pendingSeekerRemovals)
+            {
+                while (pendingSeekerRemovals.Count > 0)
+                {
+                    Seeker seeker = pendingSeekerRemovals.Dequeue();
+                    if (!seekers.Remove(seeker)) continue;
+                    if (draggedSeeker == seeker) draggedSeeker = null;
+                    soundEffects.StopLoop(seeker);
+                    if (seekerStampCache.TryGetValue(seeker, out GliderStampCache cache))
+                    {
+                        cache.Bitmap?.Dispose();
+                        seekerStampCache.Remove(seeker);
+                    }
+                    foreach (SeekerTrail trail in seeker.Trails) trail.Stamp?.Dispose();
+                    if (IsHandleCreated) BeginInvoke(new Action(() => CloseSeekerWindow(seeker)));
+                }
+            }
+
+            // Apply pending scale change
+            if (pendingScale > 0)
+            {
+                GameScale = pendingScale;
+                pendingScale = -1;
+                presenter.Resize(GameScale);
+                pollCounter = 999; // Immediately re-poll platforms (units changed)
+            }
+
+            // Which windows exist is asked four times a second; where they are, every frame.
+            if (++pollCounter >= 15)
+            {
+                pollCounter = 0;
+                EnumerateWindows();
+            }
+            RebuildSolids(dt);
+
+            if (introWakeUp)
+            {
+                // Startup wake-up: freeze physics, play only wakeUp + hair sim; switch to idle when done.
+                float hx = 0f, hy = 0f;
+                if (HairMeta.TryGet(player.CurrentFrameId, out var wm)) { hx = wm.Offset.X; hy = wm.Offset.Y; }
+                player.UpdateHairOnly(dt, hx, hy);
+                player.Sprite.Update(dt);
+                // Its frame callbacks speak through her queue; nothing else drains it this frame.
+                DrainPlayerSounds();
+                // wakeUp has no goto: finishing it leaves the sprite on no animation at all.
+                if (player.Sprite.CurrentAnimationID == "" && player.Sprite.LastAnimationID == "wakeUp")
+                {
+                    introWakeUp = false;
+                    player.PlaySprite("idle", true);
+                    Log("wake up done -> idle");
+                }
+                return;
+            }
+
+            // Input
+            var input = SampleInput();
+            if (wakeUpPending)
+            {
+                // Deferred to the top of a frame on purpose: set mid-frame, introWakeUp's
+                // animation would be replaced by the state machine's before the frame ended,
+                // and the wake would never finish.
+                wakeUpPending = false;
+                introWakeUp = true;
+                player.PlaySprite("wakeUp", true);
+                return;
+            }
+
+            bool frozenAtStart = player.FreezeFramesEnabled && player.IsHitStopped;
+            if (!frozenAtStart)
+            {
+                // Hair/Sprite/Sweat components update before StateMachine in Player.
+                player.Sprite.Update(dt);
+                sweatSprite.Update(dt);
+                if (ParticlesEnabled) EmitAnimationParticles();
+
+                tiredFlashTimer += dt;
+                while (tiredFlashTimer >= 0.05f)
+                {
+                    tiredFlashTimer -= 0.05f;
+                    tiredFlash = !tiredFlash;
+                }
+            }
+
+            // Physics
+            int wasState = player.State;
+            bool wasDeadOrRespawning = player.IsDead || player.IsRespawning;
+            // Napping is the shell's animation, not the player's; UpdateSprite lays her down.
+            player.Napping = idleDirector.Napping;
+            player.Update(dt, input);
+            UpdateSoundEffects(wasState);
+            if (!wasDeadOrRespawning) ApplyEdgeWrap();
+
+            bool playerRespawningNow = player.IsRespawning;
+            if (playerRespawningNow && !observedPlayerRespawning)
+            {
+                // Level.Reload makes a new Player, and its constructor calls Input.ResetGrab.
+                grabInput.Reset();
+                // Level.Reload recreates room entities in Celeste. Menu-spawned
+                // desktop entities have no map loader, so reset them explicitly.
+                seekerRespawnDormant = true;
+                draggedSeeker = null;
+                foreach (Seeker seeker in seekers)
+                    seeker.ResetForRoomReload(player.Center);
+            }
+            observedPlayerRespawning = playerRespawningNow;
+            // Real hands only: the director walking her about must not count, or she
+            // would stroll back over and wake the seeker that just killed her.
+            bool anyInput = realInputThisFrame || dragging;
+            if (seekerRespawnDormant && !playerRespawningNow && anyInput)
+                seekerRespawnDormant = false;
+
+            // A frame that began frozen only advances the raw freeze countdown.
+            if (frozenAtStart)
+            {
+                UpdateDashCoreVisuals(0f); // observe the dash, but do not spawn/age FX
+                return;
+            }
+
+            // An entity of the scene, so behind the freeze-frame return like the rest of them.
+            grabbyIcon.Update(!player.IsDead && !player.IsPreDeath &&
+                grabInput.Mode == GrabModes.Toggle && grabCheck, dt);
+
+            // UpdateSprite ran inside player.Update and chose her animation there.
+            bool restartSweat = player.SweatAnimSequenceCount != observedSweatAnimSequenceCount;
+            observedSweatAnimSequenceCount = player.SweatAnimSequenceCount;
+            if (sweatSprite.Has(player.SweatAnimId)) sweatSprite.Play(player.SweatAnimId, restartSweat);
+            // Player.orig_Update orders UpdateSprite before UpdateCarry; the held actor's curve
+            // follows the frame UpdateSprite settled on, and its CarryYOffset.
+            player.UpdateCarryPosition(ResolveCarryYOffset(player.CurrentFrameId));
+            if (ParticlesEnabled) EmitAnimationParticles();
+
+            float hairX = 0f, hairY = 0f;
+            if (HairMeta.TryGet(player.CurrentFrameId, out var hairMeta))
+            {
+                hairX = hairMeta.Offset.X;
+                hairY = hairMeta.Offset.Y;
+            }
+            player.UpdateHairOnly(dt, hairX, hairY);
+            UpdateCatTail(dt);
+
+            // DashBegin starts freeze mid-update, after sprite selection and hair
+            // anchoring, but before DashCoroutine creates slash/trail effects.
+            if (player.FreezeFramesEnabled && player.IsHitStopped)
+            {
+                UpdateDashCoreVisuals(0f);
+                return;
+            }
+
+            var seekerWorldBounds = new RectangleF(
+                virtualDesktop.Left / (float)GameScale,
+                virtualDesktop.Top / (float)GameScale,
+                virtualDesktop.Width / (float)GameScale,
+                virtualDesktop.Height / (float)GameScale);
+
+            foreach (Glider glider in gliders)
+            {
+                glider.Update(dt, input, player.Solids, player.MinX, player.MaxX);
+                while (glider.SoundEvents.Count > 0)
+                {
+                    PlayerSoundEvent sound = glider.SoundEvents.Dequeue();
+                    soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                }
+                if (glider.MovementSoundActive)
+                {
+                    soundEffects.StartLoop(glider,
+                        "event:/new_content/game/10_farewell/glider_movement");
+                    soundEffects.SetLoopParameter(glider, "glider_speed", glider.MovementSoundSpeed);
+                }
+                else soundEffects.StopLoop(glider);
+            }
+
+            foreach (TheoCrystal theo in theos)
+            {
+                theo.Update(dt, player, player.Solids, seekerWorldBounds);
+                while (theo.SoundEvents.Count > 0)
+                {
+                    PlayerSoundEvent sound = theo.SoundEvents.Dequeue();
+                    soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                }
+                while (theo.ImpactEvents.Count > 0)
+                {
+                    TheoImpactEvent effect = theo.ImpactEvents.Dequeue();
+                    if (ParticlesEnabled)
+                        seekerParticles.Emit(theoImpact, effect.Position.X, effect.Position.Y,
+                            effect.Direction, .87266465f, 12, effect.RangeX, effect.RangeY);
+                }
+                if (theo.Removed)
+                    lock (pendingTheoRemovals) pendingTheoRemovals.Enqueue(theo);
+            }
+
+            foreach (Bumper bumper in bumpers)
+            {
+                if (bumper.Removed) { RequestBumperRemoval(bumper); continue; }
+                int hitsBefore = bumper.Hits;
+                bumper.Update(dt, player);
+                while (bumper.SoundEvents.Count > 0)
+                {
+                    PlayerSoundEvent sound = bumper.SoundEvents.Dequeue();
+                    soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                }
+                // The twelve P_Launch particles, thrown the way she went. The dash slash that
+                // goes with them is already hers, from ExplodeLaunch.
+                if (bumper.Hits != hitsBefore)
+                    particles.Emit(bumperLaunch,
+                        bumper.Pos.X + bumper.LaunchDirection.X * 12f,
+                        bumper.Pos.Y + bumper.LaunchDirection.Y * 12f,
+                        (float)Math.Atan2(bumper.LaunchDirection.Y, bumper.LaunchDirection.X),
+                        .6981317f, 12, 3f, 3f);
+                // And the one it gives off while it is waiting to be hit, every twentieth of a
+                // second, thrown outwards from eight pixels out.
+                for (int puff = 0; puff < bumper.AmbientPuffs; puff++)
+                {
+                    float angle = (float)(bumperSparkle.NextDouble() * Math.PI * 2.0);
+                    particles.Emit(bumperAmbience,
+                        bumper.Pos.X + (float)Math.Cos(angle) * 8f,
+                        bumper.Pos.Y + (float)Math.Sin(angle) * 8f,
+                        angle, .5235988f, 1, 2f, 2f);
+                }
+            }
+            foreach (Puffer puffer in puffers)
+            {
+                if (puffer.Removed) { RequestPufferRemoval(puffer); continue; }
+                puffer.Update(dt, player, player.Solids, theos, seekerWorldBounds.Bottom);
+                while (puffer.SoundEvents.Count > 0)
+                {
+                    PlayerSoundEvent sound = puffer.SoundEvents.Dequeue();
+                    soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                }
+                // Puffer.Explode throws Seeker.P_Regen in a ring around itself -- the
+                // seeker's particle, borrowed by the game itself rather than by this.
+                for (int burst = 0; burst < puffer.Explosions; burst++)
+                    for (float angle = 0f; angle < (float)(Math.PI * 2.0); angle += .17453292f)
+                    {
+                        float away = 12f + (float)pufferSparkle.NextDouble() * 6f;
+                        particles.Emit(seekerRegen,
+                            puffer.Pos.X + (float)Math.Cos(angle) * away,
+                            puffer.Pos.Y + (float)Math.Sin(angle) * away, angle, .03490659f, 1);
+                    }
+            }
+
+            var seekerCamera = new RectangleF(player.Pos.X - 160f, player.Pos.Y - 90f, 320f, 180f);
+            foreach (Seeker seeker in seekers)
+            {
+                // Squished: it removed itself, and its window and its place in this list go
+                // with it. Nothing else reaps a seeker that decided its own end -- removal has
+                // always come from the tray or from a request, and a crush is neither.
+                if (seeker.Removed) { RequestSeekerRemoval(seeker); continue; }
+                if (seekerRespawnDormant) seeker.UpdateDormant(dt, player.Solids, seekerWorldBounds);
+                else seeker.Update(dt, player, player.Solids, seekerWorldBounds, seekerCamera, theos);
+                while (seeker.SoundEvents.Count > 0)
+                {
+                    PlayerSoundEvent sound = seeker.SoundEvents.Dequeue();
+                    soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                }
+                if (seeker.BoopedLoopActive)
+                    soundEffects.StartLoop(seeker, "event:/game/05_mirror_temple/seeker_booped");
+                else soundEffects.StopLoop(seeker);
+                while (seeker.ParticleEvents.Count > 0)
+                {
+                    SeekerParticleEvent effect = seeker.ParticleEvents.Dequeue();
+                    if (!ParticlesEnabled) continue;
+                    PType type = effect.Kind == SeekerParticleKind.HitWall ? seekerHitWall :
+                        effect.Kind == SeekerParticleKind.Stomp ? seekerStomp :
+                        effect.Kind == SeekerParticleKind.Regen ? seekerRegen : seekerAttack;
+                    // ParticleType.DirectionRange is the full arc; ParticleSystem.Emit
+                    // accepts a +/- half-range.
+                    float directionRange = effect.Kind == SeekerParticleKind.Regen
+                        ? (float)Math.PI / 6f : .87266465f;
+                    seekerParticles.Emit(type, effect.Position.X, effect.Position.Y, effect.Direction,
+                        directionRange, effect.Count, effect.RangeX, effect.RangeY);
+                }
+            }
+
+            UpdateWavedashWaves(dt);
+
+            // Back onto a display first; only a position no display can account for resets.
+            SnapIntoView();
+            SnapEntitiesIntoView();
+            // Auto-reset when far off-screen (prevents infinite fall / being thrown off the virtual desktop)
+            if (!introWakeUp && !player.IsDead) CheckAutoReset();
+
+            // Particles (run/land/jump/dash) + dash slash timing
+            if (ParticlesEnabled)
+            {
+                EmitPlayerParticles(dt, wasState);
+                particles.Update(dt);
+                seekerParticles.Update(dt);
+            }
+            else
+            {
+                particles.Clear();
+                seekerParticles.Clear();
+                observedJumpEffectCount = player.JumpEffectCount;
+                observedWallJumpEffectCount = player.WallJumpEffectCount;
+                observedLandingEffectCount = player.LandingEffectCount;
+            }
+
+            UpdateDashCoreVisuals(dt);
+        }
+
+        static Color Rgb(int value) => Color.FromArgb((value >> 16) & 255, (value >> 8) & 255, value & 255);
+        static int RgbValue(Color value) => (value.R << 16) | (value.G << 8) | value.B;
+
+        PointF? FindFreeSeekerSpawn(PointF desired, int facing)
+        {
+            bool Free(PointF candidate)
+            {
+                var bounds = new RectangleF(
+                    virtualDesktop.Left / (float)GameScale + 3f,
+                    virtualDesktop.Top / (float)GameScale - 5f,
+                    virtualDesktop.Width / (float)GameScale - 6f,
+                    virtualDesktop.Height / (float)GameScale + 2f);
+                if (!bounds.Contains(candidate)) return false;
+                foreach (Solid solid in player.Solids)
+                    if (candidate.X - 3f < solid.R && candidate.X + 3f > solid.L &&
+                        candidate.Y - 3f < solid.B && candidate.Y + 3f > solid.T)
+                        return false;
+                foreach (Seeker seeker in seekers)
+                    if (!seeker.Removed && Math.Abs(candidate.X - seeker.Pos.X) < 6f &&
+                        Math.Abs(candidate.Y - seeker.Pos.Y) < 6f)
+                        return false;
+                return true;
+            }
+
+            if (Free(desired)) return desired;
+            int direction = facing == 0 ? 1 : facing;
+            // The physics hitbox is 6x6. Eight-pixel steps leave a small visible
+            // gap and keep repeated menu spawns close to the requested position.
+            for (int ring = 1; ring <= 12; ring++)
+            {
+                float d = ring * 8f;
+                PointF[] candidates =
+                {
+                    new PointF(desired.X + direction * d, desired.Y),
+                    new PointF(desired.X - direction * d, desired.Y),
+                    new PointF(desired.X, desired.Y - d),
+                    new PointF(desired.X, desired.Y + d),
+                    new PointF(desired.X + direction * d, desired.Y - d),
+                    new PointF(desired.X - direction * d, desired.Y - d),
+                    new PointF(desired.X + direction * d, desired.Y + d),
+                    new PointF(desired.X - direction * d, desired.Y + d)
+                };
+                foreach (PointF candidate in candidates)
+                    if (Free(candidate)) return candidate;
+            }
+            // Do not create an overlapping actor if the compact spawn area is full.
+            return null;
+        }
+
+        void UpdateSoundEffects(int wasState)
+        {
+            if (wasState == Player.StDreamDash && player.State != Player.StDreamDash)
+                soundEffects.StopLoop();
+            DrainPlayerSounds();
+            if (player.Ducking != soundDucking)
+            {
+                // orig_Update sounds the duck wherever it happens, but standing up only counts
+                // on the ground: unducking into a hyper off a ledge is not someone standing up.
+                if (!player.IsDead && !player.IsRespawning && (player.Ducking || player.onGround))
+                    soundEffects.Play(player.Ducking
+                        ? "event:/char/madeline/duck"
+                        : "event:/char/madeline/stand");
+                soundDucking = player.Ducking;
+            }
+            // Player.swimSurfaceLoopSfx: dragging along the top of the water, whether she is
+            // swimming in it or wading through the shallow end of it.
+            if (player.SwimSurfaceMoving)
+                soundEffects.StartLoop("swim", "event:/char/madeline/water_move_shallow");
+            else soundEffects.StopLoop("swim");
+            // orig_Update tests the sprite selected on the preceding frame before
+            // UpdateSprite chooses the next one later in the same player update.
+            bool wallSliding = player.AnimId == "wallslide" && player.Speed.Y > 0f;
+            if (wallSliding)
+            {
+                soundEffects.StartLoop("wallslide", "event:/char/madeline/wallslide");
+                soundEffects.SetLoopParameter("wallslide", "surface_index",
+                    player.WallSurfaceSoundIndex(player.Facing));
+            }
+            else soundEffects.StopLoop("wallslide");
+        }
+
+        /// <summary>Everything she asked to hear this frame, in order.</summary>
+        void DrainPlayerSounds()
+        {
+            while (player.SoundEvents.Count > 0)
+            {
+                PlayerSoundEvent sound = player.SoundEvents.Dequeue();
+                if (sound.IsStop) { soundEffects.StopLoop(sound.Key); continue; }
+                if (sound.Key != null) { soundEffects.PlayKept(sound.Key, sound.Path); continue; }
+                soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+                if (sound.Path == "event:/char/madeline/dreamblock_enter")
+                    soundEffects.StartLoop("event:/char/madeline/dreamblock_travel");
+            }
+        }
+
+        internal Color ResolveHairColor(int dashes, Color fallback)
+        {
+            if (customHairColorsEnabled) return customHairColors[Math.Max(0, Math.Min(2, dashes))];
+            return skinManager.ResolveHairColor(dashes, fallback);
+        }
+
+        internal float ResolveCarryYOffset(string frameId)
+        {
+            // PlayerSprite.CarryYOffset: the frame's metadata, times the sprite's Y scale.
+            return HairMeta.CarryYOffset(frameId) * player.SpriteScaleY;
+        }
+
+        static PointF Approach(PointF value, PointF target, float maxMove)
+        {
+            float dx = target.X - value.X, dy = target.Y - value.Y;
+            float length = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (length <= maxMove || length == 0f) return target;
+            return new PointF(value.X + dx / length * maxMove, value.Y + dy / length * maxMove);
+        }
+
+        void UpdateCatTail(float dt)
+        {
+            if (!catTailEnabled) { catTailStarted = false; return; }
+            float hx = 0f, hy = 0f;
+            if (HairMeta.TryGet(player.CurrentFrameId, out var hm)) { hx = hm.Offset.X; hy = hm.Offset.Y; }
+            var root = new PointF(player.Pos.X + hx * player.Facing,
+                player.Pos.Y - 2f * player.SpriteScaleY + hy);
+            if (!catTailStarted)
+            {
+                for (int i = 0; i < CatTailCount; i++) catTailNodes[i] = root;
+                catTailStarted = true;
+            }
+            catTailNodes[0] = root;
+            float amount = 1.5f;
+            var step = new PointF(0f, -1f);
+            var target = new PointF(root.X - player.Facing * amount * 2f + step.X, root.Y + step.Y);
+            PointF previous = root;
+            for (int i = 1; i < CatTailCount; i++)
+            {
+                if (i == CatTailCount / 2)
+                {
+                    float sine = (float)Math.Sin(player.Hair.Wave);
+                    step = new PointF(0f, -1f + 0.5f * sine);
+                    amount = 1.5f + 0.5f * sine;
+                }
+                float speed = (1f - (float)i / CatTailCount * 0.5f) * 32f;
+                catTailNodes[i] = Approach(catTailNodes[i], target, speed * dt);
+                float dx = catTailNodes[i].X - previous.X, dy = catTailNodes[i].Y - previous.Y;
+                float distance = (float)Math.Sqrt(dx * dx + dy * dy);
+                if (distance > 2f)
+                    catTailNodes[i] = new PointF(previous.X + dx / distance * 2f, previous.Y + dy / distance * 2f);
+                target = new PointF(catTailNodes[i].X - player.Facing * amount + step.X,
+                    catTailNodes[i].Y + step.Y);
+                previous = catTailNodes[i];
+            }
+        }
+
+        void UpdateDashCoreVisuals(float dt)
+        {
+            // Existing effects update before Player/DashCoroutine can add new ones,
+            // so a freshly-created slash or snapshot renders once at age zero.
+            if (slash.Active)
+            {
+                slash.Age += dt;
+                slash.X += (float)Math.Cos(slash.Angle) * 8f * dt;
+                slash.Y += (float)Math.Sin(slash.Angle) * 8f * dt;
+                if (slash.Age >= 0.4f) slash.Active = false;
+            }
+            for (int i = dashTrails.Count - 1; i >= 0; i--)
+            {
+                dashTrails[i].Age += dt;
+                if (dashTrails[i].Age >= 1f)
+                {
+                    dashTrails[i].Mask?.Dispose();
+                    dashTrails.RemoveAt(i);
+                }
+            }
+
+            if (player.ExplodeLaunchSequenceCount != observedExplodeLaunchCount)
+            {
+                observedExplodeLaunchCount = player.ExplodeLaunchSequenceCount;
+                slash = new SlashVisual
+                {
+                    Active = true,
+                    X = player.Center.X,
+                    Y = player.Center.Y,
+                    Angle = player.ExplodeLaunchAngle
+                };
+            }
+
+            if (player.DashSequenceCount != observedDashSequenceCount)
+            {
+                observedDashSequenceCount = player.DashSequenceCount;
+                dashVisualPending = true;
+                dashVisualTimer = -1f;
+                dashTrailStage = 0;
+            }
+
+            // Celeste.Freeze(0.05) occurs before DashCoroutine creates SlashFx and the first trail.
+            bool spawnedThisFrame = false;
+            if (dashVisualPending && !player.IsFrozen)
+            {
+                dashVisualPending = false;
+                dashVisualTimer = 0f;
+                slash = new SlashVisual
+                {
+                    Active = true,
+                    X = player.Pos.X,
+                    Y = player.Pos.Y - 5.5f,
+                    Angle = (float)Math.Atan2(player.DashDir.Y, player.DashDir.X)
+                };
+                CaptureDashTrail();
+                dashTrailStage = 1;
+                spawnedThisFrame = true;
+            }
+
+            if (dashVisualTimer >= 0f && !spawnedThisFrame)
+            {
+                dashVisualTimer += dt;
+                // Normal DashCoroutine: immediate snapshot, DashUpdate snapshot at 0.08,
+                // and final coroutine snapshot at 0.15 seconds. Super Dashing sets
+                // dashTrailTimer to 0.1 with a counter of 2 and waits 0.3 instead, so it
+                // lays a fourth: 0.1, 0.2 and 0.3. Each stage latches the next, so the
+                // variant being toggled part-way through a dash cannot strand the timer.
+                bool superDash = player.SuperDashing;
+                if (dashTrailStage == 1 && dashVisualTimer >= (superDash ? 0.1f : 0.08f))
+                {
+                    CaptureDashTrail();
+                    dashTrailStage = 2;
+                }
+                if (dashTrailStage == 2 && dashVisualTimer >= (superDash ? 0.2f : 0.15f))
+                {
+                    CaptureDashTrail();
+                    dashTrailStage = superDash ? 3 : 4;
+                    if (!superDash) dashVisualTimer = -1f;
+                }
+                if (dashTrailStage == 3 && dashVisualTimer >= 0.3f)
+                {
+                    CaptureDashTrail();
+                    dashTrailStage = 4;
+                    dashVisualTimer = -1f;
+                }
+            }
+
+            if (player.State == Player.StDreamDash)
+            {
+                dreamTrailTimer -= dt;
+                if (dreamTrailTimer <= 0f)
+                {
+                    CaptureDashTrail();
+                    dreamTrailTimer += 0.1f;
+                }
+            }
+            else
+                dreamTrailTimer = 0f;
+
+        }
+
+        void CaptureDashTrail()
+        {
+            string frameId = player.CurrentFrameId ?? (player.Ducking ? "duck" : "dash00");
+            PointF[] tailNodes = null;
+            if (catTailEnabled)
+            {
+                tailNodes = new PointF[CatTailCount];
+                Array.Copy(catTailNodes, tailNodes, CatTailCount);
+            }
+            var trail = new DashTrail
+            {
+                X = player.Pos.X,
+                Y = player.Pos.Y,
+                ScaleX = player.SpriteScaleX,
+                ScaleY = player.SpriteScaleY,
+                Facing = player.Facing,
+                FrameId = frameId,
+                // TrailManager.Add snapshots the hair as PlayerHair.Render would draw it.
+                Hair = HairMeta.HasHair(frameId) ? BuildHairPlan() : null,
+                CatTailNodes = tailNodes,
+                HairColor = player.HairColor,
+                // Player.GetTrailColor(wasDashB), through the skin's hook on it.
+                Tint = player.TrailColor(player.LastDashWasTwo)
+            };
+            // TrailRecolor's hook on TrailManager.Add: a skin's trail scale, for a dash's trail the
+            // dashes it began with, applies to the snapshot and lifts its hair to match.
+            SmhHair smhHair = player.Skin?.Hair;
+            if (smhHair?.LastDashes is int trailDashes &&
+                (smhHair.GetHairScaleWithSpecified((int)SmhHair.Special.Trail, player.StartedDashingCount, out PointF trailScale) ||
+                 smhHair.GetHairScaleWithSpecified((int)SmhHair.Special.Trail, trailDashes, out trailScale)))
+            {
+                float lift = (float)Math.Round((trailScale.Y - trail.ScaleY) * -9f);
+                trail.ScaleX *= trailScale.X;
+                trail.ScaleY *= trailScale.Y;
+                if (trail.Hair != null)
+                    for (int i = 0; i < trail.Hair.Pieces.Length; i++)
+                    {
+                        trail.Hair.Pieces[i].Node.Y += lift;
+                        if (i > 0)
+                            trail.Hair.Pieces[i].Scale = new PointF(
+                                (float)Math.Round(trail.Hair.Pieces[i].Scale.X * trailScale.X, 2),
+                                (float)Math.Round(trail.Hair.Pieces[i].Scale.Y * trailScale.X, 2));
+                    }
+            }
+            trail.Mask = BakeDashTrailMask(trail);
+            dashTrails.Add(trail);
+        }
+
+        Bitmap BakeDashTrailMask(DashTrail trail)
+        {
+            // Celeste's TrailManager renders hair + sprite once into an off-screen
+            // buffer, converts its resulting alpha to a white mask, then only moves and
+            // fades that immutable texture. Rebuilding individual pieces every frame
+            // changes raster coverage and causes direction-aligned shimmer.
+            const int sizePx = 64;
+            const float center = sizePx / 2f;
+            var mask = new Bitmap(sizePx, sizePx, PixelFormat.Format32bppPArgb);
+            var g = Graphics.FromImage(mask);
+            g.Clear(Color.Transparent);
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.SmoothingMode = SmoothingMode.None;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+
+            bool flip = trail.Facing < 0;
+            var blob = Sprites.Get("hair00", false);
+            if (blob != null && trail.CatTailNodes != null)
+            {
+                for (int i = 0; i < trail.CatTailNodes.Length; i++)
+                {
+                    float x = SnapPx(trail.CatTailNodes[i].X - trail.X + center);
+                    float y = SnapPx(trail.CatTailNodes[i].Y - trail.Y + center);
+                    const float tailSize = 3f;
+                    DrawTintedSafe(g, blob, Color.Black, x - tailSize / 2f - 1, y - tailSize / 2f, tailSize, tailSize);
+                    DrawTintedSafe(g, blob, Color.Black, x - tailSize / 2f + 1, y - tailSize / 2f, tailSize, tailSize);
+                    DrawTintedSafe(g, blob, Color.Black, x - tailSize / 2f, y - tailSize / 2f - 1, tailSize, tailSize);
+                    DrawTintedSafe(g, blob, Color.Black, x - tailSize / 2f, y - tailSize / 2f + 1, tailSize, tailSize);
+                }
+                // Color is a second pass so adjacent nodes do not repaint one
+                // another with outline black and turn the tail into a dark chain.
+                for (int i = 0; i < trail.CatTailNodes.Length; i++)
+                {
+                    float x = SnapPx(trail.CatTailNodes[i].X - trail.X + center);
+                    float y = SnapPx(trail.CatTailNodes[i].Y - trail.Y + center);
+                    DrawTintedSafe(g, blob, trail.HairColor, x - 1.5f, y - 1.5f, 3f, 3f);
+                }
+            }
+            // Hair.Render includes its four-direction outline. The max-blend mask pass includes
+            // that outline in the final silhouette as well.
+            if (trail.Hair != null) DrawHairPlan(g, trail.Hair, trail.X - center, trail.Y - center);
+
+            var body = Sprites.Get(trail.FrameId, flip);
+            if (body != null)
+            {
+                g.DrawImage(body,
+                    SnapPx(center - 16f * trail.ScaleX),
+                    SnapPx(center - 32f * trail.ScaleY),
+                    SnapPx(32f * trail.ScaleX), SnapPx(32f * trail.ScaleY));
+            }
+            g.Dispose();
+            // Store the final tinted stamp. Direct2D can now draw this immutable 64x64
+            // bitmap directly at its world coordinate with only an opacity change.
+            var tinted = new Bitmap(sizePx, sizePx, PixelFormat.Format32bppPArgb);
+            using (var tintGraphics = Graphics.FromImage(tinted))
+            {
+                tintGraphics.Clear(Color.Transparent);
+                tintGraphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+                tintGraphics.PixelOffsetMode = PixelOffsetMode.Half;
+                tintGraphics.SmoothingMode = SmoothingMode.None;
+                Sprites.DrawSilhouette(tintGraphics, mask, trail.Tint, 0, 0, sizePx, sizePx);
+            }
+            mask.Dispose();
+            return tinted;
+        }
+
+        // Celeste Player.Update + SpeedRing: after Super/Hyper/Wavedash jump, while speed stays
+        // at 140+ for the first 0.5s spawn a ring every 0.15s; each ring expands at 3/s and advances at 10px/s.
+        void UpdateWavedashWaves(float dt)
+        {
+            // Existing SpeedRing entities update before Player can add another one;
+            // newly emitted rings therefore render once at lerp=0 and origin position.
+            for (int i = waveRings.Count - 1; i >= 0; i--)
+            {
+                var ring = waveRings[i];
+                ring.Progress += 3f * dt;
+                ring.X += (float)Math.Cos(ring.Angle) * 10f * dt;
+                ring.Y += (float)Math.Sin(ring.Angle) * 10f * dt;
+                if (ring.Progress >= 1f) waveRings.RemoveAt(i);
+                else waveRings[i] = ring;
+            }
+
+            // DashBegin explicitly sets vanilla's `launched` flag false. This is
+            // particularly important for multi-ultras: each new diagonal dash ends
+            // the preceding jump's speed-ring sequence.
+            if (player.DashSequenceCount != observedRingDashSequenceCount)
+            {
+                observedRingDashSequenceCount = player.DashSequenceCount;
+                speedRingLaunchActive = false;
+                speedRingLaunchTimer = 0f;
+                nextSpeedRingTime = 0.15f;
+            }
+            bool launchStartedThisFrame = false;
+            if (player.LaunchCount != observedLaunchCount)
+            {
+                observedLaunchCount = player.LaunchCount;
+                // SuperJump only sets vanilla's `launched` flag. If a launch is
+                // already active it does not reset launchedTimer, which prevents
+                // chained hypers/ultras from restarting and overproducing rings.
+                if (!speedRingLaunchActive)
+                {
+                    speedRingLaunchActive = true;
+                    speedRingLaunchTimer = 0f;
+                    nextSpeedRingTime = 0.15f;
+                    launchStartedThisFrame = true;
+                }
+            }
+
+            // Player checks `launched` before its StateMachine update. A SuperJump
+            // created during that update therefore starts aging on the next frame.
+            if (speedRingLaunchActive && !launchStartedThisFrame)
+            {
+                float speedSq = player.Speed.X * player.Speed.X + player.Speed.Y * player.Speed.Y;
+                if (speedSq < 19600f)
+                {
+                    speedRingLaunchActive = false;
+                    speedRingLaunchTimer = 0f;
+                }
+                else
+                {
+                    speedRingLaunchTimer += dt;
+                    if (speedRingLaunchTimer >= 0.5f)
+                    {
+                        speedRingLaunchActive = false;
+                        speedRingLaunchTimer = 0f;
+                    }
+                    else
+                    {
+                        while (speedRingLaunchTimer >= nextSpeedRingTime)
+                        {
+                            waveRings.Add(new WaveRing
+                            {
+                                X = player.Pos.X,
+                                Y = player.Pos.Y - 5.5f,
+                                Angle = (float)Math.Atan2(player.Speed.Y, player.Speed.X)
+                            });
+                            nextSpeedRingTime += 0.15f;
+                        }
+                    }
+                }
+            }
+
+        }
+
+        // Particle emission (parameters ported from Celeste Player.cs Dust.Burst calls)
+        void EmitPlayerParticles(float dt, int wasState)
+        {
+            float up = (float)-Math.PI / 2f;
+
+            if (player.WallJumpEffectCount != observedWallJumpEffectCount)
+            {
+                observedWallJumpEffectCount = player.WallJumpEffectCount;
+                int dir = player.LastWallJumpDirection;
+                float angle = dir < 0 ? (float)(Math.PI * -3.0 / 4.0) : (float)(-Math.PI / 4.0);
+                EmitDustBurst(player.Pos.X - dir * 2f, player.Pos.Y - 5.5f, angle, 4);
+            }
+
+            if (player.JumpEffectCount != observedJumpEffectCount)
+            {
+                observedJumpEffectCount = player.JumpEffectCount;
+                EmitDustBurst(player.Pos.X, player.Pos.Y, up, 4);
+            }
+
+            if (player.LandingEffectCount != observedLandingEffectCount)
+            {
+                observedLandingEffectCount = player.LandingEffectCount;
+                EmitDustBurst(player.Pos.X, player.Pos.Y, up, 8);
+            }
+
+            if (player.ElytraDeploySequenceCount != observedElytraDeployCount)
+            {
+                observedElytraDeployCount = player.ElytraDeploySequenceCount;
+                for (int i = 0; i < 10; i++)
+                {
+                    float deviation = (float)(effectRng.NextDouble() * 2.0 - 1.0);
+                    particles.Emit(elytraDeploy, player.Pos.X, player.Pos.Y - 5.5f,
+                        player.ElytraDeployParticleAngle + deviation * 0.1f,
+                        (float)Math.PI / 4f, 1);
+                }
+            }
+
+            if (player.WallSlideDustActive)
+            {
+                int dir = player.WallSlideDirection;
+                EmitDustBurst(player.Pos.X + dir * 5f, player.Pos.Y - 1.5f, up, 1);
+            }
+
+            // Dash-attacking against the held direction emits skid dust every
+            // 0.02s from orig_UpdateSprite. Ordinary running has no dust burst.
+            if (player.IsDashAttacking && player.AnimId == "skid")
+            {
+                skidDustTimer += dt;
+                while (skidDustTimer >= 0.02f)
+                {
+                    skidDustTimer -= 0.02f;
+                    EmitDustBurst(player.Pos.X, player.Pos.Y, up, 1);
+                }
+            }
+            else skidDustTimer = 0f;
+
+            // Dash
+            if (player.State == Player.StDash)
+            {
+                float dashAngle = (float)Math.Atan2(player.DashDir.Y, player.DashDir.X);
+                if (wasState != Player.StDash)
+                {
+                    dashParticleTimer = 0f;
+                }
+                dashParticleTimer += dt;
+                // Vanilla DashUpdate: while moving, emit one P_DashA/P_DashB every 0.02s.
+                while (dashParticleTimer >= 0.02f &&
+                       (player.Speed.X != 0f || player.Speed.Y != 0f))
+                {
+                    dashParticleTimer -= 0.02f;
+                    float px = player.Pos.X + (float)(effectRng.NextDouble() * 4.0 - 2.0);
+                    float py = player.Pos.Y - 5.5f + (float)(effectRng.NextDouble() * 4.0 - 2.0);
+                    PType dashType = SkinnedParticle(!player.LastDashWasTwo ? dashBlue :
+                        player.BadelineMode ? dashBadeline : dashRed);
+                    // PlayerDashUpdateIlHook: the skin's DashPtcl colour, lightened for Color2.
+                    if (player.DashParticleColor(out Color dashColor))
+                        dashType = WithColors(dashType, dashColor, Smh.Lerp(dashColor, Color.White, 0.4f));
+                    particles.Emit(dashType,
+                        px, py, dashAngle, (float)Math.PI / 3f, 1);
+                }
+            }
+            else dashParticleTimer = 0f;
+        }
+
+        void EmitAnimationParticles()
+        {
+            // Player.OnFrameChange: pushing raises foreground dust on frames 8 and 15.
+            while (observedPushDustCount != player.PushDustCount)
+            {
+                observedPushDustCount++;
+                float dx = -player.Facing;
+                float angle = (float)Math.Atan2(-0.5f, dx);
+                EmitDustBurst(player.Pos.X - player.Facing * 5f, player.Pos.Y - 1f,
+                    angle, 1, 0f);
+            }
+        }
+
+        void EmitDustBurst(float x, float y, float direction, int count, float positionRange = 4f)
+        {
+            float perpendicular = direction - (float)Math.PI / 2f;
+            float rangeX = Math.Abs((float)Math.Cos(perpendicular) * positionRange);
+            float rangeY = Math.Abs((float)Math.Sin(perpendicular) * positionRange);
+            for (int i = 0; i < count; i++)
+            {
+                float px = x + ((float)effectRng.NextDouble() * 2f - 1f) * rangeX;
+                float py = y + ((float)effectRng.NextDouble() * 2f - 1f) * rangeY;
+                particles.Emit(SkinnedParticle(dust), px, py, direction, 0.5f, 1);
+            }
+        }
+
+        PetInput SampleInput()
+        {
+            var input = new PetInput();
+            // GetAsyncKeyState and XInput are both global. By default they are gated to
+            // this pet's focus; the explicit menu opt-in permits reading them while
+            // unfocused. No hook is installed and keys are never swallowed from other apps.
+            bool blocked = dragging || draggedGlider != null || draggedTheo != null ||
+                draggedSeeker != null || draggedBumper != null || draggedPuffer != null ||
+                (!InputWhenUnfocused && !IsPetInputWindow(Win32.GetForegroundWindow())) ||
+                // Keys pressed in a fullscreen game are the game's, whatever the opt-in says.
+                (avoidFullscreen && foregroundFullscreen);
+            bool useKeys = InputEnabled && !blocked;
+            bool usePad = PadInputEnabled && !blocked;
+
+            // Read on every frame, gated or not, the way MInput.Update does: what is wanted from
+            // a gated frame is that it be remembered, so that a key still held when the pet is
+            // focused again is a key held rather than a key pressed.
+            bindings.Poll();
+            PadState pad = PadInputEnabled ? XInputPad.Poll() : default;
+            PadState padBefore = prevPad;
+            prevPad = pad;
+            realInputThisFrame = dragging || draggedGlider != null || draggedTheo != null ||
+                draggedSeeker != null || draggedBumper != null || draggedPuffer != null;
+            // A gated frame gives her nothing of the player's, a latched Toggle included: the
+            // latch waits for focus to come back, as a held key would be read again.
+            grabCheck = false;
+            if (!useKeys && !usePad) return AutonomyOr(input);
+            // Keyboard bindings are digital, so the threshold only ever affects the controller;
+            // it reproduces Celeste's per-virtual-input deadzones.
+            bool Held(PetAction action, float threshold)
+                => (useKeys && bindings.IsDown(action)) || (usePad && padBindings.IsDown(pad, action, threshold));
+
+            bool left = Held(PetAction.Left, PadBindings.MoveXThreshold);
+            bool right = Held(PetAction.Right, PadBindings.MoveXThreshold);
+            bool up = Held(PetAction.Up, PadBindings.MoveYThreshold);
+            bool down = Held(PetAction.Down, PadBindings.MoveYThreshold);
+            bool jump = Held(PetAction.Jump, PadBindings.ButtonThreshold);
+            bool dash = Held(PetAction.Dash, PadBindings.ButtonThreshold);
+            bool grab = Held(PetAction.Grab, PadBindings.ButtonThreshold);
+            bool crouchDash = Held(PetAction.CrouchDash, PadBindings.ButtonThreshold);
+            bool elytra = Held(PetAction.DeployElytra, PadBindings.ButtonThreshold);
+
+            // Both directions at once is not nothing: see IntegerAxis. Each of these is one of
+            // Celeste's virtual inputs, so each keeps its own.
+            input.MoveX = moveX.Update(left, right);
+            input.MoveY = moveY.Update(up, down);
+            input.AimX = aimX.Update(Held(PetAction.Left, PadBindings.AimThreshold),
+                Held(PetAction.Right, PadBindings.AimThreshold));
+            input.AimY = aimY.Update(Held(PetAction.Up, PadBindings.AimThreshold),
+                Held(PetAction.Down, PadBindings.AimThreshold));
+            input.GliderMoveY = gliderMoveY.Update(
+                Held(PetAction.Up, PadBindings.GliderMoveYThreshold),
+                Held(PetAction.Down, PadBindings.GliderMoveYThreshold));
+            // Input.Feather is a joystick on the move bindings at the aim deadzone.
+            input.FeatherX = featherX.Update(Held(PetAction.Left, PadBindings.AimThreshold),
+                Held(PetAction.Right, PadBindings.AimThreshold));
+            input.FeatherY = featherY.Update(Held(PetAction.Up, PadBindings.AimThreshold),
+                Held(PetAction.Down, PadBindings.AimThreshold));
+            input.JumpHeld = jump;
+            grabCheck = grabInput.Check(grab);
+            input.GrabHeld = grabCheck;
+            input.ElytraHeld = elytra;
+
+            // Binding.Pressed, which asks each bound key and button for its own edge rather than
+            // asking the binding as a whole: one of the keys bound to jump being held is no
+            // reason for another of them to do nothing.
+            bool Pressed(PetAction action, float threshold)
+                => (useKeys && bindings.Pressed(action))
+                || (usePad && padBindings.Pressed(pad, padBefore, action, threshold));
+
+            if (Pressed(PetAction.Jump, PadBindings.ButtonThreshold)) player.BufferJump();
+            // Crouch Dash wins if both actions are pressed on the same frame, as it explicitly
+            // requests the crouched dash path used for demos/hypers in Celeste.
+            if (Pressed(PetAction.CrouchDash, PadBindings.ButtonThreshold))
+                player.BufferDash(crouchDash: true);
+            else if (Pressed(PetAction.Dash, PadBindings.ButtonThreshold)) player.BufferDash();
+
+            input.JumpPressed = player.HasJumpBuffer;
+            input.DashPressed = player.HasDashBuffer;
+            // Input.UpdateGrab runs after the scene has, so Check above already had its answer:
+            // a Toggle press reaches her the frame after it.
+            grabInput.Update(Pressed(PetAction.Grab, PadBindings.ButtonThreshold));
+            // The keys are what say someone is there, not what the grab mode makes of them:
+            // an Invert grab is every idle moment, and would keep the director away for good.
+            realInputThisFrame |= left || right || up || down || jump || dash || grab ||
+                crouchDash || elytra;
+            return AutonomyOr(input);
+        }
+
+        /// <summary>
+        /// Real input keeps the frame; a quiet one may go to the idle director, which plays
+        /// her through this same PetInput seam -- the ported physics cannot tell the two
+        /// apart, which is the point.
+        /// </summary>
+        PetInput AutonomyOr(PetInput real)
+        {
+            if (realInputThisFrame)
+            {
+                if (IdleDebugWanted) IdleDebugText = "the player is at the keys";
+                idleDirector.NoteRealInput();
+                // Interrupted mid-nap: she wakes up first, with the same animation the tray's
+                // Wake up plays, and hears the keys once she is on her feet.
+                if (idleDirector.ConsumeWakeRequest()) wakeUpPending = true;
+                return real;
+            }
+            if (!IdleAutonomyEnabled)
+            {
+                if (IdleDebugWanted) IdleDebugText = "autonomy is off (tray menu)";
+                return real;
+            }
+            idleDirector.DebugEnabled = IdleDebugWanted;
+            bool wasEngaged = idleDirector.Engaged;
+            PetInput auto = idleDirector.Drive(1f / 60f, BuildIdleContext());
+            if (IdleDebugWanted) IdleDebugText = idleDirector.DebugText;
+            // Waking on her own -- the nap ran out -- gets the stretch too.
+            if (idleDirector.ConsumeWakeRequest()) wakeUpPending = true;
+            // Until the director takes her, a quiet frame is still the player's, and under
+            // Invert or a latched Toggle a quiet frame is a grab: she stays on the wall she was
+            // left on rather than dropping the moment the keys go still. Not engaged, the
+            // director has nothing to say -- its input is empty.
+            if (!idleDirector.Engaged) return real;
+            // Taking her over is the player gone. Their latch goes with them, so that nobody
+            // comes back to a grab they did not know was on, and so the glove does not hang
+            // over an outing that is not theirs.
+            if (!wasEngaged) grabInput.Reset();
+            return auto;
+        }
+
+        /// <summary>
+        /// The debug pane's override: force an activity, optionally aimed at a window.
+        /// Called on the UI thread; the director locks internally.
+        /// </summary>
+        public void RequestIdleOverride(int activity, IntPtr window)
+        {
+            RectangleF rect = default;
+            if (window != IntPtr.Zero)
+            {
+                float s = GameScale;
+                foreach (PolledWindow w in polledWindows)
+                    if (w.Handle == window)
+                    {
+                        rect = new RectangleF(w.Rect.Left / s, w.Rect.Top / s,
+                            (w.Rect.Right - w.Rect.Left) / s,
+                            (w.Rect.Bottom - w.Rect.Top) / s);
+                        break;
+                    }
+            }
+            idleDirector.RequestOverride((IdleDirector.Activity)activity, rect);
+        }
+
+        /// <summary>The platform windows and their titles, for the pane's picker.</summary>
+        public List<KeyValuePair<IntPtr, string>> IdleDebugWindowChoices()
+        {
+            var list = new List<KeyValuePair<IntPtr, string>>();
+            foreach (PolledWindow w in polledWindows)
+            {
+                if (!w.IsPlatform) continue;
+                string title = Win32.GetWindowTextString(w.Handle);
+                if (title.Length > 44) title = title.Substring(0, 44);
+                list.Add(new KeyValuePair<IntPtr, string>(w.Handle, title));
+            }
+            return list;
+        }
+
+        IdleContext BuildIdleContext()
+        {
+            float s = GameScale;
+            idleWindowsScratch.Clear();
+            foreach (PolledWindow window in polledWindows)
+                if (window.IsPlatform)
+                    idleWindowsScratch.Add(new KeyValuePair<IntPtr, RectangleF>(window.Handle,
+                        new RectangleF(window.Rect.Left / s, window.Rect.Top / s,
+                            (window.Rect.Right - window.Rect.Left) / s,
+                            (window.Rect.Bottom - window.Rect.Top) / s)));
+            Point cursor = Cursor.Position;
+            return new IdleContext
+            {
+                Player = player,
+                Solids = player.Solids,
+                Monitors = monitorGameBounds,
+                Cursor = new PointF(cursor.X / s, cursor.Y / s),
+                ForegroundFullscreen = foregroundFullscreen,
+                WindowsAreKevin = kevinMode,
+                WindowsReactToDash = kevinMode || moonMode,
+                EdgesClimbable = (edgeWrapMode & 1) == 0,
+                EdgeLeft = player.MinX,
+                EdgeRight = player.MaxX,
+                SeekersDormant = seekerRespawnDormant,
+                Gliders = gliders,
+                Seekers = seekers,
+                Puffers = puffers,
+                Windows = idleWindowsScratch,
+            };
+        }
+
+        /// <summary>Her portrait as an icon, for the app's own windows' title bars.</summary>
+        internal Icon AppIcon => tray?.Icon;
+
+        internal bool IsPetInputWindow(IntPtr hwnd)
+        {
+            if (hwnd == Handle) return true;
+            lock (gliderWindowLock)
+                if (gliderWindows.Values.Any(window => window.IsHandleCreated && window.Handle == hwnd)) return true;
+            lock (theoWindowLock)
+                if (theoWindows.Values.Any(window => window.IsHandleCreated && window.Handle == hwnd)) return true;
+            lock (seekerWindowLock)
+                if (seekerWindows.Values.Any(window => window.IsHandleCreated && window.Handle == hwnd))
+                    return true;
+            lock (bumperWindowLock)
+                if (bumperWindows.Values.Any(window => window.IsHandleCreated && window.Handle == hwnd))
+                    return true;
+            lock (pufferWindowLock)
+                return pufferWindows.Values.Any(window => window.IsHandleCreated && window.Handle == hwnd);
+        }
+
+        void EnsureTheoWindows()
+        {
+            lock (theoWindowLock)
+            {
+                foreach (TheoCrystal theo in theos)
+                {
+                    if (theoWindows.ContainsKey(theo)) continue;
+                    var window = new TheoInputWindow(this, theo);
+                    theoWindows[theo] = window;
+                    window.Show();
+                }
+            }
+        }
+
+        internal void RequestTheoRemoval(TheoCrystal theo)
+        {
+            lock (pendingTheoRemovals) pendingTheoRemovals.Enqueue(theo);
+            BeginInvoke(new Action(() => CloseTheoWindow(theo)));
+        }
+
+        void CloseTheoWindow(TheoCrystal theo)
+        {
+            lock (theoWindowLock)
+            {
+                if (!theoWindows.TryGetValue(theo, out TheoInputWindow window)) return;
+                theoWindows.Remove(theo); window.Close(); window.Dispose();
+            }
+        }
+
+        internal void BeginTheoDrag(TheoCrystal theo)
+        {
+            Point cursor = Cursor.Position;
+            theo.BeginDrag(player);
+            draggedTheo = theo;
+            theoDragOffset = new PointF(cursor.X / (float)GameScale - theo.Pos.X,
+                cursor.Y / (float)GameScale - theo.Pos.Y);
+            lastTheoCursor = cursor;
+            theoCursorVelocity = PointF.Empty;
+        }
+
+        internal void ContinueTheoDrag(TheoCrystal theo)
+        {
+            if (draggedTheo != theo) return;
+            Point cursor = Cursor.Position;
+            const float dt = 1f / 60f;
+            theoCursorVelocity = new PointF(
+                theoCursorVelocity.X * .7f + (cursor.X - lastTheoCursor.X) / GameScale / dt * .3f,
+                theoCursorVelocity.Y * .7f + (cursor.Y - lastTheoCursor.Y) / GameScale / dt * .3f);
+            lastTheoCursor = cursor;
+            theo.DragTo(new PointF(cursor.X / (float)GameScale - theoDragOffset.X,
+                cursor.Y / (float)GameScale - theoDragOffset.Y));
+        }
+
+        internal void EndTheoDrag(TheoCrystal theo)
+        {
+            if (draggedTheo != theo) return;
+            float vx = theoCursorVelocity.X * .6f, vy = theoCursorVelocity.Y * .6f;
+            float length = (float)Math.Sqrt(vx * vx + vy * vy);
+            if (length > 400f) { vx *= 400f / length; vy *= 400f / length; }
+            if (length < 30f) vx = vy = 0f;
+            theo.EndDrag(new PointF(vx, vy));
+            draggedTheo = null;
+        }
+
+        void EnsurePufferWindows()
+        {
+            lock (pufferWindowLock)
+            {
+                foreach (Puffer puffer in puffers)
+                {
+                    if (pufferWindows.ContainsKey(puffer)) continue;
+                    var window = new PufferInputWindow(this, puffer);
+                    pufferWindows[puffer] = window;
+                    window.Show();
+                }
+            }
+        }
+
+        internal void RequestPufferRemoval(Puffer puffer)
+        {
+            lock (pendingPufferRemovals) pendingPufferRemovals.Enqueue(puffer);
+            BeginInvoke(new Action(() => ClosePufferWindow(puffer)));
+        }
+
+        void ClosePufferWindow(Puffer puffer)
+        {
+            lock (pufferWindowLock)
+            {
+                if (!pufferWindows.TryGetValue(puffer, out PufferInputWindow window)) return;
+                pufferWindows.Remove(puffer);
+                window.Close();
+                window.Dispose();
+            }
+        }
+
+        internal void BeginPufferDrag(Puffer puffer)
+        {
+            Point cursor = Cursor.Position;
+            puffer.BeginDrag();
+            draggedPuffer = puffer;
+            pufferDragOffset = new PointF(cursor.X / (float)GameScale - puffer.Pos.X,
+                cursor.Y / (float)GameScale - puffer.Pos.Y);
+        }
+
+        internal void ContinuePufferDrag(Puffer puffer)
+        {
+            if (draggedPuffer != puffer) return;
+            Point cursor = Cursor.Position;
+            puffer.DragTo(new PointF(cursor.X / (float)GameScale - pufferDragOffset.X,
+                cursor.Y / (float)GameScale - pufferDragOffset.Y));
+        }
+
+        internal void EndPufferDrag(Puffer puffer)
+        {
+            if (draggedPuffer != puffer) return;
+            puffer.EndDrag();
+            draggedPuffer = null;
+        }
+
+        void EnsureBumperWindows()
+        {
+            lock (bumperWindowLock)
+            {
+                foreach (Bumper bumper in bumpers)
+                {
+                    if (bumperWindows.ContainsKey(bumper)) continue;
+                    var window = new BumperInputWindow(this, bumper);
+                    bumperWindows[bumper] = window;
+                    window.Show();
+                }
+            }
+        }
+
+        internal void RequestBumperRemoval(Bumper bumper)
+        {
+            lock (pendingBumperRemovals) pendingBumperRemovals.Enqueue(bumper);
+            BeginInvoke(new Action(() => CloseBumperWindow(bumper)));
+        }
+
+        void CloseBumperWindow(Bumper bumper)
+        {
+            lock (bumperWindowLock)
+            {
+                if (!bumperWindows.TryGetValue(bumper, out BumperInputWindow window)) return;
+                bumperWindows.Remove(bumper);
+                window.Close();
+                window.Dispose();
+            }
+        }
+
+        internal void BeginBumperDrag(Bumper bumper)
+        {
+            Point cursor = Cursor.Position;
+            bumper.BeginDrag();
+            draggedBumper = bumper;
+            bumperDragOffset = new PointF(cursor.X / (float)GameScale - bumper.Anchor.X,
+                cursor.Y / (float)GameScale - bumper.Anchor.Y);
+        }
+
+        internal void ContinueBumperDrag(Bumper bumper)
+        {
+            if (draggedBumper != bumper) return;
+            Point cursor = Cursor.Position;
+            bumper.DragTo(new PointF(cursor.X / (float)GameScale - bumperDragOffset.X,
+                cursor.Y / (float)GameScale - bumperDragOffset.Y));
+        }
+
+        internal void EndBumperDrag(Bumper bumper)
+        {
+            if (draggedBumper != bumper) return;
+            bumper.EndDrag();
+            draggedBumper = null;
+        }
+
+        void EnsureSeekerWindows()
+        {
+            lock (seekerWindowLock)
+            {
+                foreach (Seeker seeker in seekers)
+                {
+                    if (seekerWindows.ContainsKey(seeker)) continue;
+                    var window = new SeekerInputWindow(this, seeker);
+                    seekerWindows[seeker] = window;
+                    window.Show();
+                }
+            }
+        }
+
+        internal void RequestSeekerRemoval(Seeker seeker)
+        {
+            lock (pendingSeekerRemovals) pendingSeekerRemovals.Enqueue(seeker);
+            BeginInvoke(new Action(() => CloseSeekerWindow(seeker)));
+        }
+
+        void CloseSeekerWindow(Seeker seeker)
+        {
+            lock (seekerWindowLock)
+            {
+                if (!seekerWindows.TryGetValue(seeker, out SeekerInputWindow window)) return;
+                seekerWindows.Remove(seeker);
+                window.Close();
+                window.Dispose();
+            }
+        }
+
+        internal void BeginSeekerDrag(Seeker seeker)
+        {
+            Point cursor = Cursor.Position;
+            seeker.BeginDrag();
+            draggedSeeker = seeker;
+            seekerDragOffset = new PointF(cursor.X / (float)GameScale - seeker.Pos.X,
+                cursor.Y / (float)GameScale - seeker.Pos.Y);
+            lastSeekerCursor = cursor;
+            seekerCursorVelocity = PointF.Empty;
+        }
+
+        internal void ContinueSeekerDrag(Seeker seeker)
+        {
+            if (draggedSeeker != seeker) return;
+            Point cursor = Cursor.Position;
+            const float dt = 1f / 60f;
+            seekerCursorVelocity = new PointF(
+                seekerCursorVelocity.X * .7f + (cursor.X - lastSeekerCursor.X) / GameScale / dt * .3f,
+                seekerCursorVelocity.Y * .7f + (cursor.Y - lastSeekerCursor.Y) / GameScale / dt * .3f);
+            lastSeekerCursor = cursor;
+            seeker.DragTo(new PointF(cursor.X / (float)GameScale - seekerDragOffset.X,
+                cursor.Y / (float)GameScale - seekerDragOffset.Y));
+        }
+
+        internal void EndSeekerDrag(Seeker seeker)
+        {
+            if (draggedSeeker != seeker) return;
+            float vx = seekerCursorVelocity.X * .6f, vy = seekerCursorVelocity.Y * .6f;
+            float length = (float)Math.Sqrt(vx * vx + vy * vy);
+            if (length > 400f) { vx *= 400f / length; vy *= 400f / length; }
+            if (length < 30f) vx = vy = 0f;
+            seeker.EndDrag(new PointF(vx, vy));
+            draggedSeeker = null;
+        }
+
+        void EnsureGliderWindows()
+        {
+            lock (gliderWindowLock)
+            {
+                foreach (Glider glider in gliders)
+                {
+                    if (gliderWindows.ContainsKey(glider)) continue;
+                    var window = new JellyInputWindow(this, glider);
+                    gliderWindows[glider] = window;
+                    window.Show();
+                }
+            }
+        }
+
+        internal string Localize(string key) => Loc.T(key);
+
+        internal void RequestGliderRemoval(Glider glider)
+        {
+            lock (pendingGliderRemovals)
+                pendingGliderRemovals.Enqueue(glider);
+
+            // Let the ToolStrip click finish before disposing its owner window.
+            BeginInvoke(new Action(() => CloseGliderWindow(glider)));
+        }
+
+        void CloseGliderWindow(Glider glider)
+        {
+            lock (gliderWindowLock)
+            {
+                if (!gliderWindows.TryGetValue(glider, out JellyInputWindow window)) return;
+                gliderWindows.Remove(glider);
+                window.Close();
+                window.Dispose();
+            }
+        }
+
+        internal void BeginGliderDrag(Glider glider)
+        {
+            Point cursor = Cursor.Position;
+            glider.BeginDrag(player);
+            draggedGlider = glider;
+            gliderDragOffset = new PointF(cursor.X / (float)GameScale - glider.Pos.X,
+                cursor.Y / (float)GameScale - glider.Pos.Y);
+            lastGliderCursor = cursor;
+            gliderCursorVelocity = PointF.Empty;
+        }
+
+        internal void ContinueGliderDrag(Glider glider)
+        {
+            if (draggedGlider != glider) return;
+            Point cursor = Cursor.Position;
+            const float dt = 1f / 60f;
+            gliderCursorVelocity = new PointF(
+                gliderCursorVelocity.X * 0.7f + (cursor.X - lastGliderCursor.X) / GameScale / dt * 0.3f,
+                gliderCursorVelocity.Y * 0.7f + (cursor.Y - lastGliderCursor.Y) / GameScale / dt * 0.3f);
+            lastGliderCursor = cursor;
+            glider.DragTo(new PointF(cursor.X / (float)GameScale - gliderDragOffset.X,
+                cursor.Y / (float)GameScale - gliderDragOffset.Y));
+        }
+
+        internal void EndGliderDrag(Glider glider)
+        {
+            if (draggedGlider != glider) return;
+            float vx = gliderCursorVelocity.X * 0.6f, vy = gliderCursorVelocity.Y * 0.6f;
+            float length = (float)Math.Sqrt(vx * vx + vy * vy);
+            if (length > 400f) { vx *= 400f / length; vy *= 400f / length; }
+            if (length < 30f) vx = vy = 0f;
+            glider.EndDrag(new PointF(vx, vy));
+            draggedGlider = null;
+        }
+
+        // ================= Platforms (windows are platforms; hollow borders) =================
+        /// <summary>Physical pixels to game pixels, snapped to the whole-pixel grid.</summary>
+        /// <remarks>
+        /// Celeste's collision is defined on whole pixels: Actor.MoveH/MoveV step one pixel at
+        /// a time and every Solid is an integer rect, so a player who has come to rest against
+        /// a wall has her collider edge exactly on the wall edge, and the port inherits checks
+        /// that rely on it.  Player.SlipCheck probes the single point at the collider edge
+        /// while the climb wall check is a box overlap reaching one pixel further; between the
+        /// two lies a sub-pixel band where she counts as on the wall but the slip probe misses
+        /// it, and climbing becomes a permanent 30px/s slip.  Window rectangles are physical
+        /// pixels and rarely divide evenly by GameScale, so every coordinate handed to the
+        /// physics is snapped here instead.
+        ///
+        /// Rounds halves up rather than through Math.Round, whose default tie-break is to the
+        /// nearest even integer: that maps 15.5 and 16.5 both onto 16, so at 8x the two edges
+        /// of an 8px window border would land on the same grid line and the border would
+        /// disappear.  Adding 0.5 before flooring keeps whole-pixel offsets whole for every
+        /// coordinate, negative ones on secondary monitors included.
+        /// </remarks>
+        float ToGamePixels(int physical) => (float)Math.Floor(physical / (double)GameScale + 0.5);
+
+        /// <summary>Physical-pixel rect to a grid-aligned Solid; false when it rounds away to nothing.</summary>
+        bool TryToSolid(IntPtr id, Win32.RECT r, bool dream, out Solid solid)
+        {
+            float l = ToGamePixels(r.Left), t = ToGamePixels(r.Top);
+            float right = ToGamePixels(r.Right), b = ToGamePixels(r.Bottom);
+            // A remnant narrower than a game pixel has no grid representation.  Keeping it
+            // would leave a zero-width wall that still blocks movement but that SlipCheck's
+            // point probe can never hit.  WindowEdges keeps real borders at least a pixel
+            // thick, so only slivers left behind by occlusion are dropped here.
+            if (right <= l || b <= t) { solid = default; return false; }
+            solid = new Solid { Id = id, L = l, T = t, R = right, B = b, Dream = dream };
+            return true;
+        }
+
+        /// <summary>
+        /// A window that has moved onto her shoves her out of the way, and crushes her against
+        /// whatever is behind her if there is nowhere to go -- Solid.MoveHExact's other half,
+        /// the one PetWindow never had.
+        /// </summary>
+        /// <remarks>
+        /// Two things here are not Celeste's, because a dragged window is not a Celeste solid.
+        ///
+        /// A solid in the game moves a pixel or two a frame; a window arrives wherever the
+        /// mouse left it, which between two polls can be the far side of the screen. Pushing
+        /// her that whole way would crush her against the first thing behind her every time
+        /// somebody flung a window, so past TeleportPush the movement is treated as what it is
+        /// -- a jump rather than a shove -- and she is simply set down in the nearest free spot
+        /// instead, alive.
+        ///
+        /// The window she is standing on is not left out, though the ride-along has already
+        /// moved her with it. It cannot move her twice: the push only acts on an overlap, and
+        /// only by as deep as the overlap goes. What it is for is the fraction the ride-along
+        /// cannot carry -- a window moves in screen pixels, and only whole game pixels reach
+        /// her position, so a window rising under her feet leaves her a fraction inside its
+        /// border. Inside is exactly where a solid stops holding her up, so without this she
+        /// falls through the window she is standing on, and only when it moves faster than the
+        /// rounding can follow, which is to say almost always.
+        /// </remarks>
+        /// <remarks>
+        /// A speed rather than a distance, because a distance per frame is only meaningful at
+        /// one frame rate. No hand drags a window four thousand pixels a second; a snap, a
+        /// maximise or a virtual-desktop switch covers that in a single frame. Below it the
+        /// window is being dragged and pushes her; above it the window was put somewhere, the
+        /// space between never existed, and killing her for crossing it would be arbitrary.
+        ///
+        /// It was sixteen pixels a frame before -- 960 a second -- which an ordinary brisk drag
+        /// beats, so real drags were being treated as teleports and she could not be crushed by
+        /// one at all.
+        /// </remarks>
+        /// <remarks>
+        /// Hand-tuned, like the reach below and the interval the enumeration runs at. None of
+        /// the three is a number from Celeste -- the game has no dragged windows to measure --
+        /// so the only thing that says whether they are right is using the pet, and they have
+        /// each moved once already for exactly that reason.
+        /// </remarks>
+        const float TeleportSpeed = 4000f;   // game pixels a second
+
+        void PushOutOfMovedWindows(List<Solid> solids, Dictionary<IntPtr, Win32.RECT> cur, float dt)
+        {
+            // Derived from the step actually taken, so a slower frame does not turn an ordinary
+            // drag into a teleport.
+            float teleportPush = TeleportSpeed * dt;
+            if (player.IsDead || player.IsRespawning || dragging || introWakeUp) return;
+            int s = GameScale;
+            foreach (var pair in cur)
+            {
+                if (!lastRects.TryGetValue(pair.Key, out var old)) continue;
+                float dx = ToGamePixels(pair.Value.Left - old.Left);
+                float dy = ToGamePixels(pair.Value.Top - old.Top);
+                if (dx == 0f && dy == 0f) continue;
+
+                // Only the pieces this window contributed, at where they are now. Whether each
+                // is pushing her, and how far, is Player.SweptInto's to decide.
+                bool teleported = Math.Abs(dx) > teleportPush || Math.Abs(dy) > teleportPush;
+                foreach (Solid piece in solids)
+                {
+                    if (piece.Id != pair.Key || !player.OverlapsHitbox(piece)) continue;
+                    if (teleported) { player.DisplaceOutOfSolids(); break; }
+                    if (!player.SweptInto(piece, dx, dy)) break;
+                }
+                SweepEntities(solids, pair.Key, dx, dy, teleported);
+            }
+        }
+
+        /// <summary>
+        /// The same for everything else loose on the desktop. Solid.MoveHExact walks every
+        /// Actor, not only the player: a window carries the crystal standing on it, shoves the
+        /// jellyfish drifting through it, and squishes either against whatever is behind.
+        /// </summary>
+        /// <remarks>
+        /// What each does when squished is the game's: the crystal breaks, and the jellyfish
+        /// and the seeker are simply gone, all three after three pixels of wiggle rather than
+        /// the player's three by five.
+        ///
+        /// Except that the jellyfish is never squished here. Celeste removes it -- Glider
+        /// .OnSquish is three pixels of wiggle and then RemoveSelf, with no sound and nothing
+        /// left behind -- but a jellyfish on a desktop is something somebody asked for and is
+        /// playing with, and losing it to an accidental nudge of a window is a poor trade for
+        /// fidelity. It is pushed like everything else and sits inside whatever it cannot be
+        /// pushed clear of.
+        ///
+        /// The crystal follows the game, which spares it under Invincible: TheoCrystal.OnSquish
+        /// asks the assist before it calls Die. The seeker is spared by nothing, which is also
+        /// the game's answer, and it is hostile, so it keeps it. Nor is the pufferfish, which
+        /// needs no sparing: Puffer.OnSquish sets it off and it swims back two and a half
+        /// seconds later. It is the one thing here a window never carries, its IsRiding being
+        /// false for solids and jumpthrus alike -- it floats, so nothing it is over is holding
+        /// it up. Their sub-pixel remainders are kept here rather than in
+        /// them, one entry per thing being carried, because riding a window is a desktop
+        /// arrangement and not something a Celeste entity knows about itself.
+        /// </remarks>
+        readonly Dictionary<object, PointF> rideRemainders = new Dictionary<object, PointF>();
+
+        void SweepEntities(List<Solid> solids, IntPtr window, float dx, float dy, bool teleported)
+        {
+            foreach (Solid piece in solids)
+            {
+                if (piece.Id != window) continue;
+                foreach (Glider glider in gliders)
+                {
+                    if (glider.IsHeld || glider.BeingDragged) continue;
+                    var at = glider.Pos;
+                    if (Carry(glider, piece, ref at, Glider.HalfWidth, 0f, dx, dy))
+                        { glider.Pos = at; continue; }
+                    if (teleported) continue;
+                    // Pushed like everything else, and never squished: what it cannot be
+                    // pushed clear of, it sits inside until it drifts out.
+                    ActorSweep.Push(solids, ref at, Glider.HalfWidth, -Glider.ColliderHeight,
+                        0f, piece, dx, dy);
+                    glider.Pos = at;
+                }
+                foreach (TheoCrystal theo in theos)
+                {
+                    if (theo.IsHeld || theo.BeingDragged || theo.Removed || theo.IsDying) continue;
+                    var at = theo.Pos;
+                    if (Carry(theo, piece, ref at, TheoCrystal.HalfWidth, 0f, dx, dy))
+                        { theo.SnapIntoView(at); continue; }
+                    if (teleported) continue;
+                    if (!ActorSweep.Push(solids, ref at, TheoCrystal.HalfWidth,
+                        -TheoCrystal.ColliderHeight, 0f, piece, dx, dy) && !player.Invincible)
+                        theo.Crush();
+                    theo.SnapIntoView(at);
+                }
+                foreach (Puffer puffer in puffers)
+                {
+                    if (puffer.Removed || puffer.BeingDragged ||
+                        puffer.State == Puffer.States.Gone) continue;
+                    // No Carry: Puffer.IsRiding is false for a solid and for a jumpthru alike,
+                    // so a window sweeps past a fish floating over it rather than taking it
+                    // along. Shoved by one, though, like every other Actor in the scene -- and
+                    // what cannot be shoved clear goes off where it stands.
+                    if (teleported) continue;
+                    var floating = puffer.Pos;
+                    if (!ActorSweep.Push(solids, ref floating, Puffer.HalfWidth,
+                            -Puffer.HalfHeight, Puffer.HalfHeight, piece, dx, dy))
+                        puffer.Squish(player, solids, theos);
+                    puffer.Pos = floating;
+                }
+                foreach (Seeker seeker in seekers)
+                {
+                    if (seeker.Removed) continue;
+                    var at = seeker.Pos;
+                    // A seeker's box is centred on its position rather than standing on it.
+                    if (Carry(seeker, piece, ref at, Seeker.HalfSize, Seeker.HalfSize, dx, dy))
+                        { seeker.Pos = at; continue; }
+                    if (teleported) continue;
+                    if (!ActorSweep.Push(solids, ref at, Seeker.HalfSize,
+                        -Seeker.HalfSize, Seeker.HalfSize, piece, dx, dy))
+                    {
+                        AddDeathBurst(seeker.Pos, Color.HotPink);
+                        seeker.Crush();
+                    }
+                    seeker.Pos = at;
+                }
+            }
+        }
+
+        /// <summary>Standing on it: carried whole pixels at a time, the fraction kept.</summary>
+        bool Carry(object entity, Solid piece, ref PointF pos, float halfWidth, float bottom,
+            float dx, float dy)
+        {
+            if (!ActorSweep.RidingOn(piece, pos, halfWidth, bottom)) return false;
+            rideRemainders.TryGetValue(entity, out PointF carried);
+            carried = new PointF(carried.X + dx, carried.Y + dy);
+            int rideX = (int)Math.Round(carried.X, MidpointRounding.ToEven);
+            int rideY = (int)Math.Round(carried.Y, MidpointRounding.ToEven);
+            rideRemainders[entity] = new PointF(carried.X - rideX, carried.Y - rideY);
+            pos = new PointF(pos.X + rideX, pos.Y + rideY);
+            return true;
+        }
+
+        /// <summary>
+        /// Moon-block mode: hand every window to MoonWindows, along with which of them have
+        /// something standing on them and whether she has just dashed into one.
+        /// </summary>
+        /// <remarks>
+        /// A FloatySpaceBlock sinks under any rider, so anything standing on a window counts --
+        /// her, the crystal, the jellyfish, the seeker. The dash is asked here rather than in
+        /// Player because the block is the desktop's idea, not hers: vanilla routes it through
+        /// a DashCollision on the block itself, which is the same question asked from the other
+        /// side -- is she dashing into this thing right now.
+        /// </remarks>
+        void DriftMoonWindows(float dt, List<Solid> solids, List<PolledWindow> zorder)
+        {
+            // Solid.GetRiders, asked of each window in turn as Celeste asks it: whoever would
+            // be carried if it moved is riding it. For her that counts the wall she is holding
+            // as well as the floor under her feet, so grabbing a block sinks it the same way.
+            var ridden = new HashSet<IntPtr>();
+            foreach (Solid piece in solids)
+            {
+                if (ridden.Contains(piece.Id)) continue;
+                if (player.IsRiding(piece)) { ridden.Add(piece.Id); continue; }
+                foreach (Glider glider in gliders)
+                    if (!glider.IsHeld && ActorSweep.RidingOn(piece, glider.Pos, Glider.HalfWidth, 0f))
+                        ridden.Add(piece.Id);
+                foreach (TheoCrystal theo in theos)
+                    if (!theo.IsHeld && !theo.Removed &&
+                        ActorSweep.RidingOn(piece, theo.Pos, TheoCrystal.HalfWidth, 0f))
+                        ridden.Add(piece.Id);
+                foreach (Seeker seeker in seekers)
+                    if (!seeker.Removed &&
+                        ActorSweep.RidingOn(piece, seeker.Pos, Seeker.HalfSize, Seeker.HalfSize))
+                        ridden.Add(piece.Id);
+            }
+
+            // Read fresh, and with GetWindowRect rather than the poll's DWM frame: this is the
+            // one place the pet writes a window's position instead of reading it, and it has to
+            // ask and answer in the same coordinates SetWindowPos uses. The poll is four times a
+            // second, which for something moved every frame would be far too stale anyway.
+            var info = new List<PolledWindowInfo>(zorder.Count);
+            foreach (PolledWindow window in zorder)
+            {
+                if (!window.IsPlatform) continue;
+                if (!Win32.GetWindowRect(window.Handle, out Win32.RECT raw)) continue;
+                info.Add(new PolledWindowInfo(window.Handle, raw, true));
+            }
+            moonWindows.Update(dt, GameScale, info, ridden);
+        }
+
+        /// <summary>
+        /// One frame of the kevin mode: windows read fresh in their own coordinates, the
+        /// desktop's edge for vanilla's level bounds, and the block's sounds, loops and
+        /// particles carried out on this side of the fence.
+        /// </summary>
+        void DriveKevinWindows(float dt, List<Solid> solids, List<PolledWindow> zorder)
+        {
+            var info = new List<PolledWindowInfo>(zorder.Count);
+            foreach (PolledWindow window in zorder)
+            {
+                if (!window.IsPlatform) continue;
+                if (!Win32.GetWindowRect(window.Handle, out Win32.RECT raw)) continue;
+                info.Add(new PolledWindowInfo(window.Handle, raw, true));
+            }
+            Rectangle desk = GetVirtualDesktopBounds();
+            var bounds = new Win32.RECT
+            { Left = desk.Left, Top = desk.Top, Right = desk.Right, Bottom = desk.Bottom };
+            kevinWindows.SetScale(GameScale);
+            kevinWindows.Update(dt, GameScale, info, solids, bounds);
+
+            while (kevinWindows.SoundEvents.Count > 0)
+            {
+                PlayerSoundEvent sound = kevinWindows.SoundEvents.Dequeue();
+                soundEffects.Play(sound.Path, sound.Parameter, sound.Value);
+            }
+            while (kevinWindows.LoopEvents.Count > 0)
+            {
+                KevinLoopEvent loop = kevinWindows.LoopEvents.Dequeue();
+                string key = "kevin:" + loop.Window.ToInt64() + ":" + loop.Path;
+                switch (loop.Command)
+                {
+                    case KevinLoopCommand.Start: soundEffects.StartLoop(key, loop.Path); break;
+                    // Vanilla winds the move loop down through its "end" parameter and lets
+                    // it fall silent on its own; the Stop arrives half a second later.
+                    case KevinLoopCommand.Ending: soundEffects.SetLoopParameter(key, "end", 1f); break;
+                    case KevinLoopCommand.Stop: soundEffects.StopLoop(key); break;
+                }
+            }
+            while (kevinWindows.ParticleEvents.Count > 0)
+            {
+                KevinParticleEvent burst = kevinWindows.ParticleEvents.Dequeue();
+                PType type = burst.Kind == KevinParticleKind.Activate ? kevinActivate
+                    : burst.Kind == KevinParticleKind.Crushing ? kevinCrushing : kevinImpact;
+                // pi/6 is P_Activate's and P_Crushing's own spread; the impact smoke keeps
+                // the dust family's half radian.
+                float spread = burst.Kind == KevinParticleKind.Impact ? .5f : .5235988f;
+                particles.Emit(type, burst.X, burst.Y, burst.Direction, spread, burst.Count,
+                    burst.RangeX, burst.RangeY);
+            }
+        }
+
+        /// <summary>A window the poll kept: its frame, and whether it may be stood on.</summary>
+        readonly struct PolledWindow
+        {
+            public readonly IntPtr Handle;
+            public readonly Win32.RECT Rect;
+            /// <summary>False for a window that hides what is behind it but is not a platform.</summary>
+            public readonly bool IsPlatform;
+
+            public PolledWindow(IntPtr handle, Win32.RECT rect, bool isPlatform)
+            {
+                Handle = handle;
+                Rect = rect;
+                IsPlatform = isPlatform;
+            }
+        }
+
+        /// <summary>
+        /// Which windows there are, in front-to-back order. The expensive half of a poll: it
+        /// walks every top-level window and asks the shell about each one, so it runs a few
+        /// times a second rather than every frame. What it finds is kept in polledWindows and
+        /// re-measured by RebuildSolids in between.
+        /// </summary>
+        static readonly uint OwnProcessId = (uint)Environment.ProcessId;
+
+        void EnumerateWindows()
+        {
+            IntPtr self = Handle;
+            var zorder = new List<PolledWindow>();
+
+            Win32.EnumWindows((hwnd, _) =>
+            {
+                if (hwnd == self) return true;
+                if (!Win32.IsWindowVisible(hwnd) || Win32.IsIconic(hwnd)) return true;
+                // Windows cloaked by DWM (UWP background, off virtual desktop)
+                if (Win32.DwmGetWindowAttribute(hwnd, Win32.DWMWA_CLOAKED, out int cloaked, 4) == 0 && cloaked != 0) return true;
+                int ex = Win32.GetWindowLong(hwnd, Win32.GWL_EXSTYLE);
+                if ((ex & Win32.WS_EX_TOOLWINDOW) != 0) return true;
+                // Click-through transparent windows (other pets / overlays) are not platforms
+                if ((ex & Win32.WS_EX_LAYERED) != 0 && (ex & Win32.WS_EX_TRANSPARENT) != 0) return true;
+                string cls = Win32.GetClassNameString(hwnd);
+                if (cls == "Progman" || cls == "WorkerW" || cls == "Xaml_WindowedPopupClass") return true;
+                // Menus, and everything else this program puts on the screen: its tray menu,
+                // its dialogs. Dropped outright rather than kept as occluders the way an
+                // ignored window is -- a menu opening over the window she is standing on would
+                // cut the border out from under her feet for as long as it was up, and it is
+                // hers to close, which is worse than simply not being there. #32768 is the
+                // class every classic right-click menu has; the tray menu is one of ours.
+                if (cls == "#32768") return true;
+                Win32.GetWindowThreadProcessId(hwnd, out uint owner);
+                if (owner == OwnProcessId) return true;
+                if (!waterMode && dreamBlockMode && (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")) return true;
+                if (!Win32.TryGetWindowRect(hwnd, out var r)) return true;
+                if (r.Width < 24 || r.Height < 18) return true;
+                // An ignored window is still in front of whatever it covers, so it is kept as
+                // an occluder: dropping it outright would leave the borders of every window
+                // underneath standing as walls in a place the user sees nothing at all.
+                bool isPlatform = !(ignoreMaximizedWindows && IsMaximizedOrFullscreen(hwnd, r));
+                // Only platforms are tracked between polls; the ride-along follows the window
+                // underfoot, and nothing can be standing on one of these.
+                zorder.Add(new PolledWindow(hwnd, r, isPlatform));
+                return true;
+            }, IntPtr.Zero);
+            polledWindows = zorder;
+            // Whether the user is watching something: a foreground window covering its whole
+            // monitor, taskbar and all, which a maximized window does not.
+            // A dialog the fullscreen window opened is still the fullscreen window's: it is
+            // owned by it, and sits in front of it, so her going behind the owner leaves both
+            // in front of her.
+            IntPtr fullscreen = IntPtr.Zero;
+            for (IntPtr w = Win32.GetForegroundWindow(); w != IntPtr.Zero && fullscreen == IntPtr.Zero;
+                 w = Win32.GetWindow(w, Win32.GW_OWNER))
+                if (IsFullscreenWindow(w)) fullscreen = w;
+            foregroundFullscreen = fullscreen != IntPtr.Zero;
+            IntPtr behind = avoidFullscreen ? fullscreen : IntPtr.Zero;
+            // Anything that activates her -- the flyout, a click on her on another monitor --
+            // brings her back to the front of her band, over the window she was behind. So the
+            // order is checked on every poll, not only when the window changes.
+            bool overtaken = IsOvertaken(AlwaysOnTop && behind == IntPtr.Zero);
+            if (behind != steppedBehind || (behind != IntPtr.Zero && !IsBehind(behind)) || overtaken)
+                RequestStepAside(behind);
+            // Which windows there are, and in what order they stack, has just been decided
+            // afresh. Neither shows up as a rectangle moving -- bringing a window to the front
+            // changes what occludes what while every rectangle stays exactly where it was --
+            // so the geometry has to be rebuilt whether or not anything moved.
+            windowsChanged = true;
+        }
+
+        /// <summary>The windows the last enumeration kept, in front-to-back order.</summary>
+        List<PolledWindow> polledWindows = new List<PolledWindow>();
+        bool windowsChanged = true;
+
+        /// <summary>
+        /// Where those windows are now, and everything that follows from it: the platforms she
+        /// stands on, the ride-along, and being pushed by whatever moved. The cheap half, so it
+        /// runs every frame -- a drag is 60Hz or better, and at four samples a second the pet
+        /// saw a window cross half the screen between one look and the next, which is no longer
+        /// a push but a teleport.
+        /// </summary>
+        /// <summary>
+        /// How fast a window is moving, in game pixels a second: Platform.LiftSpeed, for
+        /// whatever is standing on it or being shoved by it to take with them.
+        /// </summary>
+        /// <remarks>
+        /// Two ways of knowing, and the first is the better one. A window the pet is drifting
+        /// itself can say what it meant to move, which is what vanilla measures -- Platform's
+        /// lift speed is the movement asked for, not the whole pixels that came of it -- so a
+        /// moon block bobbing one pixel every fifth frame lifts at the twenty a second it is
+        /// really rising at, rather than sixty for a frame and nothing for four. A window
+        /// somebody else moved can only be measured, so it is: where it is now against where
+        /// it was last frame, which is exactly what she was carried by.
+        /// </remarks>
+        PointF WindowLift(IntPtr handle, Win32.RECT now, float dt)
+        {
+            if (dt <= 0f) return PointF.Empty;
+            if (moonMode && moonWindows.TryVelocity(handle, out PointF drifting)) return drifting;
+            if (!lastRects.TryGetValue(handle, out var old)) return PointF.Empty;
+            float dx = ToGamePixels(now.Left - old.Left), dy = ToGamePixels(now.Top - old.Top);
+            // The same line PushOutOfMovedWindows draws, for the same reason: past it the
+            // window was put somewhere rather than moved, the space between never existed,
+            // and launching her off a maximise would be as arbitrary as crushing her with it.
+            float teleport = TeleportSpeed * dt;
+            if (Math.Abs(dx) > teleport || Math.Abs(dy) > teleport) return PointF.Empty;
+            return new PointF(dx / dt, dy / dt);
+        }
+
+        void RebuildSolids(float dt)
+        {
+            float s = GameScale;
+            var cur = new Dictionary<IntPtr, Win32.RECT>();
+            var zorder = new List<PolledWindow>(polledWindows.Count);
+            bool moved = false;
+            foreach (PolledWindow window in polledWindows)
+            {
+                if (!Win32.TryGetWindowRect(window.Handle, out var now)) { moved = true; continue; }
+                if (window.IsPlatform) cur[window.Handle] = now;
+                zorder.Add(new PolledWindow(window.Handle, now, window.IsPlatform));
+                if (!moved && (now.Left != window.Rect.Left || now.Top != window.Rect.Top ||
+                    now.Right != window.Rect.Right || now.Bottom != window.Rect.Bottom))
+                    moved = true;
+            }
+            // Asking where every window is costs a call each; working out what that means costs
+            // rather more, and on a still desktop it would mean the same thing every frame.
+            if (!moved && !windowsChanged)
+            {
+                // Except that moon blocks keep a clock, and it has to tick on the frames where
+                // nothing moved as well -- they move in whole game pixels, so a bob spends five
+                // frames out of six holding still, and a clock that only ran when something had
+                // already moved would wind down and stop. The geometry is last frame's, which
+                // is exactly right: nothing moved.
+                if (moonMode) DriftMoonWindows(dt, player.Solids, zorder);
+                else if (kevinMode) DriveKevinWindows(dt, player.Solids, zorder);
+                return;
+            }
+            polledWindows = zorder;
+            windowsChanged = false;
+
+            // Build platforms (game units): keep only hollow window borders; front (higher Z) windows
+            // subtract their full rect from rear borders so covered segments no longer collide.
+            var solids = new List<Solid>(zorder.Count * 4 + 1);
+            // Water is not solid, so it travels in a list of its own; see Player.WaterAt.
+            var waters = new List<Solid>(waterMode ? zorder.Count : 0);
+            var occluders = new List<Win32.RECT>(zorder.Count);
+            // Windows in front that hide what is behind them without being solid themselves.
+            var hidersOnly = new List<Win32.RECT>();
+            foreach (var window in zorder)
+            {
+                var r = window.Rect;
+                PointF lift = WindowLift(window.Handle, r, dt);
+                if (window.IsPlatform)
+                {
+                    if (dreamBlockMode || waterMode)
+                    {
+                        // Dream blocks and pools both union with each other: overlapping
+                        // windows are one shape, and cutting them apart only invents edges
+                        // that belong to no window.  What does come out is the ignored windows
+                        // -- maximized and fullscreen -- and whatever they cover, which is
+                        // solid nobody can see.
+                        foreach (var p in SubtractRects(r, hidersOnly))
+                            if (TryToSolid(window.Handle, p, dreamBlockMode, out Solid filled))
+                            {
+                                filled.LiftX = lift.X; filled.LiftY = lift.Y;
+                                (waterMode ? waters : solids).Add(filled);
+                            }
+                    }
+                    else
+                    {
+                        foreach (var edge in WindowEdges(r))
+                        {
+                            var pieces = SubtractRects(edge, occluders);
+                            foreach (var p in pieces)
+                                if (TryToSolid(window.Handle, p, false, out Solid piece))
+                                {
+                                    piece.LiftX = lift.X; piece.LiftY = lift.Y;
+                                    solids.Add(piece);
+                                }
+                        }
+                    }
+                }
+                occluders.Add(r);   // This window as a whole occludes windows behind it
+                if (!window.IsPlatform) hidersOnly.Add(r);
+            }
+            // Treat the exposed perimeter of the monitor union as solid.  Each edge
+            // extends outward, then other monitor rectangles are subtracted from it:
+            // a shared seam stays open while offset/non-overlapping portions are walls.
+            int virtualLeft = int.MaxValue, virtualRight = int.MinValue;
+            var screenRects = new List<Win32.RECT>();
+            monitorGameBounds.Clear();
+            foreach (var screen in Screen.AllScreens)
+            {
+                var bounds = screen.Bounds;
+                screenRects.Add(new Win32.RECT
+                {
+                    Left = bounds.Left, Top = bounds.Top,
+                    Right = bounds.Right, Bottom = bounds.Bottom
+                });
+                monitorGameBounds.Add(RectangleF.FromLTRB(
+                    ToGamePixels(bounds.Left), ToGamePixels(bounds.Top),
+                    ToGamePixels(bounds.Right), ToGamePixels(bounds.Bottom)));
+                virtualLeft = Math.Min(virtualLeft, bounds.Left);
+                virtualRight = Math.Max(virtualRight, bounds.Right);
+            }
+            // Kept to one monitor, the world is that monitor alone: every edge of it is an edge
+            // of the screen, to wrap across or to stand against, and the others are not there.
+            if (edgeWrapMode != 0 && edgeWrapOneMonitor && screenRects.Count > 1)
+            {
+                int kept = ConfinedMonitorIndex();
+                var only = screenRects[kept];
+                var onlyGame = monitorGameBounds[kept];
+                screenRects.Clear(); screenRects.Add(only);
+                monitorGameBounds.Clear(); monitorGameBounds.Add(onlyGame);
+                virtualLeft = only.Left;
+                virtualRight = only.Right;
+            }
+            else confinedMonitor = RectangleF.Empty;
+            int edgeDepth = Math.Max(64, (int)Math.Ceiling(400f * s));
+            foreach (var r in screenRects)
+            {
+                var outsideEdges = new[]
+                {
+                    new KeyValuePair<bool, Win32.RECT>(false,
+                        new Win32.RECT { Left = r.Left, Top = r.Top - edgeDepth, Right = r.Right, Bottom = r.Top }),
+                    new KeyValuePair<bool, Win32.RECT>(false,
+                        new Win32.RECT { Left = r.Left, Top = r.Bottom, Right = r.Right, Bottom = r.Bottom + edgeDepth }),
+                    new KeyValuePair<bool, Win32.RECT>(true,
+                        new Win32.RECT { Left = r.Left - edgeDepth, Top = r.Top, Right = r.Left, Bottom = r.Bottom }),
+                    new KeyValuePair<bool, Win32.RECT>(true,
+                        new Win32.RECT { Left = r.Right, Top = r.Top, Right = r.Right + edgeDepth, Bottom = r.Bottom })
+                };
+                foreach (var edge in outsideEdges)
+                {
+                    if (edge.Key ? (edgeWrapMode & 1) != 0 : (edgeWrapMode & 2) != 0) continue;
+                    foreach (var p in SubtractRects(edge.Value, screenRects))
+                        if (TryToSolid(FloorId, p, false, out Solid piece))
+                        {
+                            piece.OffScreen = true;
+                            solids.Add(piece);
+                        }
+                }
+            }
+
+            // Screen bounds under PerMonitorV2 are physical pixels, same as DWM.
+            // Compute left/right extremes from the real monitor union to avoid SystemInformation DPI virtualization.
+            if (virtualLeft != int.MaxValue)
+            {
+                if ((edgeWrapMode & 1) != 0)
+                {
+                    player.MinX = -100000f;
+                    player.MaxX = 100000f;
+                }
+                else
+                {
+                    player.MinX = ToGamePixels(virtualLeft);
+                    player.MaxX = ToGamePixels(virtualRight);
+                }
+            }
+
+            // The world she is about to be moved around in is this one, so hand it over before
+            // moving her in it. Being pushed asks what is in the way, and asking the last
+            // frame's list means asking where the border used to be -- which for a window
+            // being dragged upwards is below where it is now, so the step that should have
+            // been blocked was allowed, and she was left inside a border that had already
+            // risen past her. Inside is where a solid stops holding her up.
+            player.Solids = solids;
+            player.Waters = waters;
+
+            // The window underfoot moved: she goes with it. Player.RideAlong keeps the
+            // fraction that will not fit in a whole game pixel.
+            if (player.RidingId != IntPtr.Zero && player.RidingId != FloorId &&
+                lastRects.TryGetValue(player.RidingId, out var oldR) &&
+                cur.TryGetValue(player.RidingId, out var newR))
+                player.RideAlong((newR.Left - oldR.Left) / s, (newR.Top - oldR.Top) / s);
+            else player.EndRide();
+
+            PushOutOfMovedWindows(solids, cur, dt);
+            if (moonMode) DriftMoonWindows(dt, solids, zorder);
+            else if (kevinMode) DriveKevinWindows(dt, solids, zorder);
+            else
+            {
+                if (moonWindows.Active) moonWindows.Restore();
+                if (kevinWindows.Active) kevinWindows.Restore();
+            }
+            lastRects.Clear();
+            foreach (var kv in cur) lastRects[kv.Key] = kv.Value;
+        }
+
+        /// <summary>Which of this poll's monitors she is kept to, in the one-monitor mode.</summary>
+        /// <remarks>
+        /// The one she is on, and then the same one for as long as she stays about it: wrapping
+        /// lets her run a little past an edge before she comes back at the other, and a
+        /// neighbouring monitor there must not take her over. Carrying her somewhere else is
+        /// how she changes monitor, so a drag, or finding herself well away from it, picks again.
+        /// </remarks>
+        int ConfinedMonitorIndex()
+        {
+            if (!dragging && !player.BeingDragged && !confinedMonitor.IsEmpty)
+                for (int i = 0; i < monitorGameBounds.Count; i++)
+                {
+                    RectangleF m = monitorGameBounds[i];
+                    if (m != confinedMonitor) continue;
+                    m.Inflate(SpaceWrapBottom + 32f, SpaceWrapBottom + 32f);
+                    if (m.Contains(player.Pos.X, player.Pos.Y - player.CurrentHitHeight * 0.5f)) return i;
+                }
+            float cx = player.Pos.X, cy = player.Pos.Y - player.CurrentHitHeight * 0.5f;
+            int nearest = 0;
+            float nearestDistance = float.MaxValue;
+            for (int i = 0; i < monitorGameBounds.Count; i++)
+            {
+                RectangleF m = monitorGameBounds[i];
+                float dx = cx - Math.Max(m.Left, Math.Min(m.Right, cx));
+                float dy = cy - Math.Max(m.Top, Math.Min(m.Bottom, cy));
+                float distance = dx * dx + dy * dy;
+                if (distance < nearestDistance) { nearestDistance = distance; nearest = i; }
+            }
+            confinedMonitor = monitorGameBounds[nearest];
+            return nearest;
+        }
+
+        void ApplyEdgeWrap()
+        {
+            if (edgeWrapMode == 0 || player.IsDead || player.IsRespawning ||
+                player.BeingDragged || monitorGameBounds.Count == 0) return;
+
+            // Her hitbox: 8 wide about her position, CurrentHitHeight tall above it.
+            float h = player.CurrentHitHeight;
+            float offsetX = 0f, offsetY = 0f;
+            if ((edgeWrapMode & 1) != 0 && WrapAcross(monitorGameBounds, true, player.Pos.Y - h * 0.5f,
+                    player.Pos.X - 4f, player.Pos.X + 4f, player.Speed.X, EdgeWrapSide, EdgeWrapSide, out float x))
+                offsetX = x;
+            if ((edgeWrapMode & 2) != 0 && WrapAcross(monitorGameBounds, false, player.Pos.X,
+                    player.Pos.Y - h, player.Pos.Y, player.Speed.Y, SpaceWrapTop, SpaceWrapBottom, out float y))
+                offsetY = y;
+            player.WrapBy(offsetX, offsetY);
+        }
+
+        /// <summary>How far to move her, having gone off the displays along one axis.</summary>
+        /// <remarks>
+        /// SpaceController, the end of Core, is the rule, laid along a row or a column of the
+        /// desktop instead of the camera: once her hitbox is wholly past an edge by that side's
+        /// margin (<c>Top &gt; Camera.Bottom + 12</c>), she is set -- not carried -- to just
+        /// short of the far edge by the other side's margin (<c>Bottom = Camera.Top - 4</c>),
+        /// and the other way round. The two positions sit exactly on each other's thresholds,
+        /// so she cannot bounce between them.
+        ///
+        /// The far edge is where a ray cast back from the edge she left, along her row or
+        /// column, runs off the displays: one monitor wraps around itself, a row of touching
+        /// ones as one screen, and a gap on the line stops the ray, so each stretch of touching
+        /// monitors wraps on its own. A line no display crosses has nowhere to return to, and a
+        /// position far past a threshold was put there, not run to.
+        ///
+        /// <paramref name="low"/> and <paramref name="high"/> are her hitbox's edges along the
+        /// axis; the margins are how far past the low edge (top, left) and the high edge
+        /// (bottom, right) she goes before she wraps. Speed only settles which edge she left by
+        /// when she is off two at once, in a gap between monitors.
+        /// </remarks>
+        internal static bool WrapAcross(List<RectangleF> displays, bool horizontal, float line,
+            float low, float high, float speed, float marginLow, float marginHigh, out float shift)
+        {
+            shift = 0f;
+            var spans = new List<(float Lo, float Hi)>();
+            foreach (RectangleF d in displays)
+            {
+                float lineLo = horizontal ? d.Top : d.Left, lineHi = horizontal ? d.Bottom : d.Right;
+                if (line < lineLo || line >= lineHi) continue;
+                float lo = horizontal ? d.Left : d.Top, hi = horizontal ? d.Right : d.Bottom;
+                // Not yet past this display's thresholds: still on it, or not gone far enough.
+                if (low <= hi + marginHigh && high >= lo - marginLow) return false;
+                spans.Add((lo, hi));
+            }
+
+            // The edge she left by: the nearest behind her on either side, within reach.
+            float leftHigh = float.MinValue, leftLow = float.MaxValue;
+            foreach (var span in spans)
+            {
+                if (span.Hi + marginHigh < low && low - (span.Hi + marginHigh) <= MaxWrapOvershoot)
+                    leftHigh = Math.Max(leftHigh, span.Hi);
+                if (span.Lo - marginLow > high && span.Lo - marginLow - high <= MaxWrapOvershoot)
+                    leftLow = Math.Min(leftLow, span.Lo);
+            }
+            bool byHigh = leftHigh != float.MinValue, byLow = leftLow != float.MaxValue;
+            if (byHigh && byLow)
+            {
+                if (speed > 0f) byLow = false;
+                else if (speed < 0f) byHigh = false;
+                else if (low - (leftHigh + marginHigh) <= leftLow - marginLow - high) byLow = false;
+                else byHigh = false;
+            }
+            if (!byHigh && !byLow) return false;
+
+            // The ray back: across each display that reaches where it has got to, until none does.
+            float reach = byHigh ? leftHigh : leftLow;
+            for (bool extended = true; extended; )
+            {
+                extended = false;
+                foreach (var span in spans)
+                    if (byHigh ? span.Lo < reach && span.Hi >= reach : span.Hi > reach && span.Lo <= reach)
+                    {
+                        reach = byHigh ? span.Lo : span.Hi;
+                        extended = true;
+                    }
+            }
+            // Out past the high edge: her high edge to just short of the far low one; and back.
+            shift = byHigh ? reach - marginLow - high : reach + marginHigh - low;
+            return true;
+        }
+
+        static Rectangle ToRectangle(in Win32.RECT r) => Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+
+        /// <summary>Maximized and still titled: a working window, not a fullscreen one.</summary>
+        static bool IsMaximizedWithCaption(IntPtr hwnd)
+            => Win32.IsZoomed(hwnd) &&
+               (Win32.GetWindowLong(hwnd, Win32.GWL_STYLE) & Win32.WS_CAPTION) == Win32.WS_CAPTION;
+
+        // ---- Stepping aside for fullscreen windows (see FullscreenAvoidance) ----
+        volatile bool avoidFullscreen = true;
+        /// <summary>The window her windows sit behind, as last applied on the UI thread.</summary>
+        volatile IntPtr steppedBehind;
+        /// <summary>The composition host's handle, readable from the game-loop thread.</summary>
+        IntPtr compositionHostHandle;
+        int stepAsidePending;
+
+        /// <summary>Someone else's window, filling its monitor the way a game or a video does.</summary>
+        bool IsFullscreenWindow(IntPtr hwnd)
+        {
+            Win32.GetWindowThreadProcessId(hwnd, out uint owner);
+            if (owner == OwnProcessId || !Win32.IsWindowVisible(hwnd) || Win32.IsIconic(hwnd)) return false;
+            // The desktop fills its monitor too, and is what is focused when nothing else is.
+            string cls = Win32.GetClassNameString(hwnd);
+            if (cls == "Progman" || cls == "WorkerW") return false;
+            return Win32.TryGetWindowRect(hwnd, out Win32.RECT r) &&
+                FullscreenAvoidance.IsFullscreen(ToRectangle(r), IsMaximizedWithCaption(hwnd),
+                    Screen.FromHandle(hwnd).Bounds);
+        }
+
+        /// <summary>Whether her picture is already below <paramref name="target"/> in the z-order.</summary>
+        bool IsBehind(IntPtr target)
+        {
+            IntPtr host = compositionHostHandle;
+            if (host == IntPtr.Zero) return true;
+            for (IntPtr w = Win32.GetWindow(host, Win32.GW_HWNDPREV); w != IntPtr.Zero;
+                 w = Win32.GetWindow(w, Win32.GW_HWNDPREV))
+                if (w == target) return true;
+            return false;
+        }
+
+        /// <summary>The other windows above her picture at the last poll, while on top was asked of her.</summary>
+        HashSet<IntPtr> windowsAbove;
+
+        /// <summary>
+        /// Whether, always on top and in front of everything, she has been covered since the last
+        /// poll -- read from the native z-order, since none of the ways it happens says so.
+        /// </summary>
+        /// <remarks>
+        /// Show desktop lifts the taskbar over the rest of the topmost band, her included, and
+        /// an application coming to the front has been seen to leave her out of the band
+        /// altogether. Neither changes the fullscreen window, which is all the poll otherwise
+        /// watches. Out of the band she is always repaired; a window above her only when it is
+        /// new there, so another always-on-top program that insists on the top is ceded it after
+        /// one try rather than fought every poll.
+        /// </remarks>
+        bool IsOvertaken(bool onTop)
+        {
+            IntPtr host = compositionHostHandle;
+            if (!onTop || host == IntPtr.Zero) { windowsAbove = null; return false; }
+            var above = new HashSet<IntPtr>();
+            for (IntPtr w = Win32.GetWindow(host, Win32.GW_HWNDPREV); w != IntPtr.Zero;
+                 w = Win32.GetWindow(w, Win32.GW_HWNDPREV))
+            {
+                if (!Win32.IsWindowVisible(w)) continue;
+                if (Win32.DwmGetWindowAttribute(w, Win32.DWMWA_CLOAKED, out int cloaked, 4) == 0 && cloaked != 0) continue;
+                Win32.GetWindowThreadProcessId(w, out uint owner);
+                if (owner == OwnProcessId) continue;
+                // Menus and tooltips are over everything for a moment, and lifting her over
+                // them would draw her across another program's menu.
+                string cls = Win32.GetClassNameString(w);
+                if (cls == "#32768" || cls == "tooltips_class32") continue;
+                above.Add(w);
+            }
+            bool outOfBand = (Win32.GetWindowLong(host, Win32.GWL_EXSTYLE) & Win32.WS_EX_TOPMOST) == 0;
+            bool newlyAbove = windowsAbove == null ? above.Count > 0 : !windowsAbove.IsSupersetOf(above);
+            windowsAbove = above;
+            return outOfBand || newlyAbove;
+        }
+
+        void RequestStepAside(IntPtr target)
+        {
+            if (!IsHandleCreated || Interlocked.Exchange(ref stepAsidePending, 1) == 1) return;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    stepAsidePending = 0;
+                    IntPtr was = steppedBehind;
+                    steppedBehind = target;
+                    if (target == IntPtr.Zero)
+                    {
+                        Log(was != IntPtr.Zero ? "Fullscreen: back in front" : "Z-order: covered, lifted back on top");
+                        // Out of the topmost band she has nowhere in particular to return to:
+                        // she stays where the window she was behind leaves her.
+                        if (AlwaysOnTop) RaisePetWindows();
+                    }
+                    else
+                    {
+                        if (target != was) Log("Fullscreen: behind " + Win32.GetClassNameString(target));
+                        RaisePetWindows();
+                    }
+                }));
+            }
+            catch (InvalidOperationException) { stepAsidePending = 0; }
+        }
+
+        /// <summary>Maximized, or covering a whole monitor the way borderless fullscreen does.</summary>
+        /// <remarks>
+        /// A window this size offers nothing to stand on but its own outline around the screen,
+        /// and it is usually what the user is actually working in or watching, so treating it
+        /// as a platform is mostly in the way.
+        /// </remarks>
+        static bool IsMaximizedOrFullscreen(IntPtr hwnd, in Win32.RECT r)
+        {
+            // Maximized frames stop at the working area, so only IsZoomed catches those;
+            // fullscreen ones are not zoomed but cover their monitor exactly.
+            if (Win32.IsZoomed(hwnd)) return true;
+            Rectangle monitor = Screen.FromHandle(hwnd).Bounds;
+            return r.Left <= monitor.Left && r.Top <= monitor.Top &&
+                   r.Right >= monitor.Right && r.Bottom >= monitor.Bottom;
+        }
+
+        /// <summary>Four hollow window edges (physical-pixel coords), thickness WindowBorderPx.</summary>
+        IEnumerable<Win32.RECT> WindowEdges(Win32.RECT r)
+        {
+            // Never thinner than one game pixel: a border that rounded away to nothing on the
+            // grid would stop being a platform at all.
+            int b = Math.Max(WindowBorderPx, GameScale);
+            yield return new Win32.RECT { Left = r.Left, Top = r.Top, Right = r.Right, Bottom = r.Top + b };                 // top
+            yield return new Win32.RECT { Left = r.Left, Top = r.Bottom - b, Right = r.Right, Bottom = r.Bottom };          // bottom
+            yield return new Win32.RECT { Left = r.Left, Top = r.Top + b, Right = r.Left + b, Bottom = r.Bottom - b };      // left
+            yield return new Win32.RECT { Left = r.Right - b, Top = r.Top + b, Right = r.Right, Bottom = r.Bottom - b };    // right
+        }
+
+        /// <summary>Subtract occluder rects from rectangle a; return non-overlapping remainders.</summary>
+        static List<Win32.RECT> SubtractRects(Win32.RECT a, List<Win32.RECT> occluders)
+        {
+            var cur = new List<Win32.RECT> { a };
+            foreach (var o in occluders)
+            {
+                var next = new List<Win32.RECT>(cur.Count + 4);
+                foreach (var rc in cur)
+                {
+                    if (rc.Right <= o.Left || rc.Left >= o.Right || rc.Bottom <= o.Top || rc.Top >= o.Bottom)
+                    {
+                        next.Add(rc);
+                        continue;
+                    }
+                    if (rc.Top < o.Top) next.Add(new Win32.RECT { Left = rc.Left, Top = rc.Top, Right = rc.Right, Bottom = o.Top });
+                    if (rc.Bottom > o.Bottom) next.Add(new Win32.RECT { Left = rc.Left, Top = o.Bottom, Right = rc.Right, Bottom = rc.Bottom });
+                    int ot = Math.Max(rc.Top, o.Top), ob = Math.Min(rc.Bottom, o.Bottom);
+                    if (ot < ob)
+                    {
+                        if (rc.Left < o.Left) next.Add(new Win32.RECT { Left = rc.Left, Top = ot, Right = o.Left, Bottom = ob });
+                        if (rc.Right > o.Right) next.Add(new Win32.RECT { Left = o.Right, Top = ot, Right = rc.Right, Bottom = ob });
+                    }
+                }
+                cur = next;
+                if (cur.Count == 0) return cur;
+            }
+            return cur;
+        }
+
+        /// <summary>What each loose entity was stamped with this frame, and where.</summary>
+        /// <remarks>
+        /// Gathered on the way past so the input windows can be cut to the same shape without
+        /// working out a second time which frame of which animation is being drawn.
+        /// </remarks>
+        readonly Dictionary<object, (Bitmap Stamp, float X, float Y)> entityStamps =
+            new Dictionary<object, (Bitmap, float, float)>();
+
+        /// <summary>Cut an entity's input window down to the sprite drawn over it.</summary>
+        /// <returns>The shape applied, for the window to hold on to until the next frame.</returns>
+        byte[] ShapeEntityWindow(IntPtr window, object entity, int windowLeft, int windowTop,
+            int width, int height, int scale, byte[] mask)
+        {
+            if (!entityStamps.TryGetValue(entity, out var stamped) || stamped.Stamp == null)
+            {
+                // Held, dying or otherwise not drawn: nothing of it is on the screen, so
+                // nothing of its window should be either.
+                if (mask == null || mask.Length != 0)
+                {
+                    mask = new byte[0];
+                    Win32.SetWindowRgn(window, Win32.CreateRectRgn(0, 0, 0, 0), false);
+                }
+                return mask;
+            }
+            // The presenter centres a stamp on the rounded position; the window is placed on
+            // whole game pixels for the same reason, so this offset is exact.
+            int stampLeft = (int)Math.Round(stamped.X) - stamped.Stamp.Width / 2;
+            int stampTop = (int)Math.Round(stamped.Y) - stamped.Stamp.Height / 2;
+            HitRegion.Apply(window, stamped.Stamp,
+                new Rectangle(windowLeft / scale - stampLeft, windowTop / scale - stampTop,
+                    width, height), scale, ref mask);
+            return mask;
+        }
+
+        // ================= Rendering =================
+        void Render()
+        {
+            int s = GameScale;
+            canvas ??= new GameCanvas(CanvasW, CanvasH);
+
+            // Calculate and quantize the camera once. Previously drawing and window
+            // presentation recomputed it independently, then rounded in different
+            // coordinate spaces; moving snapshots visibly oscillated by a pixel.
+            float camX = ComputeCameraX();
+            float camY = player.Pos.Y - AnchorY;
+
+            // 1x game-pixel buffer: integer coords land on pixels (no subpixel drift); then integer nearest-neighbor upscale
+            canvas.Clear();
+            using (var g = Graphics.FromImage(canvas.Bitmap))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                g.CompositingQuality = CompositingQuality.HighSpeed;
+
+                float bodyAnchorX = player.Pos.X - camX;
+                float bodyAnchorY = player.Pos.Y - camY;
+
+                DrawWavedashWaves(g, camX, camY);
+
+                if (player.IsPreDeath)
+                {
+                    DrawPreDeath(g, camX, camY);
+                }
+                else if (player.IsDead)
+                {
+                    var death = SkinDeathEffect(player.DeathColor, false);
+                    DrawDeathEffect(g, camX, camY, player.DeathPosition,
+                        death.Color, player.DeathPercent, death.Texture);
+                }
+                else if (player.IsRespawning)
+                {
+                    var respawn = SkinDeathEffect(player.RespawnColor, true);
+                    DrawDeathEffect(g, camX, camY, player.RespawnEffectPosition,
+                        respawn.Color, player.RespawnPercent, respawn.Texture);
+                }
+                else
+                {
+                    // Draw hair behind the body (hair first, body on top). Which frames get
+                    // any is PlayerSprite.HasHair's question, and its answer is the frame
+                    // table: the sleep sheet says hair="" outright, and the wakeUp sheet she
+                    // lies asleep on is simply not in the table at all. Both are poses with
+                    // the hair painted in, and DrawBody tints that to the colour of the day.
+                    Color bodyColor = BodyColor();
+                    if (HairMeta.HasHair(player.CurrentFrameId))
+                    {
+                        DrawCatTail(g, camX, camY);
+                        DrawHair(g, camX, camY);
+                    }
+                    DrawBody(g, bodyAnchorX, bodyAnchorY, bodyColor);
+                    DrawSweat(g, bodyAnchorX, bodyAnchorY);
+                    // Glider.Depth is -5 in vanilla, in front of Player.Depth 0.
+                    // Drawing held gliders in this layer also avoids rebuilding a
+                    // separately uploaded rotated stamp on every carry frame.
+                    DrawGliders(g, camX, camY, heldOnly: true);
+                    DrawTheos(g, camX, camY, heldOnly: true);
+                }
+
+                if (ParticlesEnabled) particles.Draw(g, camX, camY);
+                DrawGrabbyIcon(g, bodyAnchorX, bodyAnchorY);
+                DrawSpeedometer(g, camX, camY);
+                DrawHitboxes(g, camX, camY);
+            }
+
+            Rectangle canvasChanged = canvas.Measure();
+            int left = (int)Math.Round(camX * s);
+            int top = (int)Math.Round(camY * s);
+            entityStamps.Clear();
+            int trailCount = Math.Min(dashTrails.Count, trailStamps.Length);
+            for (int i = 0; i < trailCount; i++)
+            {
+                var trail = dashTrails[i];
+                float remain = 1f - trail.Age;
+                float opacity = 0.75f * remain * remain * remain;
+                trailStamps[i] = new TrailStamp(trail.Mask, trail.X, trail.Y, opacity);
+            }
+            // TheoCrystal.Depth=100, behind Player.Depth=0 while unheld.
+            foreach (TheoCrystal theo in theos)
+            {
+                // IsDying: TheoCrystal.Die hides the sprite, leaving only the burst.
+                if (theo.IsHeld || theo.Removed || theo.IsDying || trailCount >= trailStamps.Length) continue;
+                // TheoCrystal.orig_ctor sets sprite.Scale.X = -1.
+                Bitmap stamp = Sprites.Get(theo.FrameId, true);
+                if (stamp != null)
+                {
+                    // Sprites.xml: theo_crystal Origin=(32,42), ten pixels below
+                    // the 64x64 frame center used by TrailStamp.
+                    trailStamps[trailCount++] = new TrailStamp(stamp, theo.Pos.X, theo.Pos.Y - 10f, 1f);
+                    entityStamps[theo] = (stamp, theo.Pos.X, theo.Pos.Y - 10f);
+                }
+            }
+            int foregroundStart = trailCount;
+            foreach (Glider glider in gliders)
+            {
+                if (glider.IsHeld) continue;
+                if (trailCount >= trailStamps.Length) break;
+                Bitmap stamp = GetGliderStamp(glider);
+                if (stamp != null)
+                {
+                    trailStamps[trailCount++] = new TrailStamp(stamp, glider.Pos.X, glider.Pos.Y, 1f);
+                    entityStamps[glider] = (stamp, glider.Pos.X, glider.Pos.Y);
+                }
+            }
+            // SlashFx.Depth is -100: in front of Glider's -5, behind Seeker's -199. It is a
+            // stamp rather than part of the canvas because the canvas is anchored to her, and
+            // something standing still in the world drawn into a buffer that moves with her is
+            // rounded twice -- once onto the game-pixel grid, once onto the screen -- and the
+            // two grids disagree by up to a pixel as she moves. That is the jitter. A stamp is
+            // placed straight into the world and rounded once.
+            if (slash.Active && trailCount < trailStamps.Length)
+            {
+                Bitmap slashStamp = GetSlashStamp(Math.Min(3, (int)(slash.Age / 0.1f)), slash.Angle);
+                if (slashStamp != null)
+                    trailStamps[trailCount++] = new TrailStamp(slashStamp, slash.X, slash.Y, 1f);
+            }
+            foreach (Seeker seeker in seekers)
+            {
+                foreach (SeekerTrail trail in seeker.Trails)
+                {
+                    if (trailCount >= trailStamps.Length) break;
+                    trail.Stamp ??= CreateSeekerStamp(trail.FrameId, trail.Facing,
+                        trail.ScaleX, trail.ScaleY, true);
+                    float remain = 1f - trail.Age / .5f;
+                    trailStamps[trailCount++] = new TrailStamp(trail.Stamp,
+                        trail.Position.X, trail.Position.Y, .75f * remain * remain * remain);
+                }
+                if (trailCount >= trailStamps.Length) break;
+                if (seeker.ShockwaveFrameId != null && trailCount < trailStamps.Length)
+                {
+                    Bitmap shockwave = Sprites.Get(seeker.ShockwaveFrameId, false);
+                    if (shockwave != null)
+                        trailStamps[trailCount++] = new TrailStamp(shockwave, seeker.Pos.X, seeker.Pos.Y, 1f);
+                }
+                Bitmap seekerStamp = GetSeekerStamp(seeker);
+                if (seekerStamp != null && trailCount < trailStamps.Length)
+                {
+                    trailStamps[trailCount++] = new TrailStamp(seekerStamp,
+                        seeker.Pos.X + seeker.Shake.X, seeker.Pos.Y + seeker.Shake.Y, 1f);
+                    entityStamps[seeker] = (seekerStamp,
+                        seeker.Pos.X + seeker.Shake.X, seeker.Pos.Y + seeker.Shake.Y);
+                }
+            }
+            foreach (Puffer puffer in puffers)
+            {
+                if (trailCount >= trailStamps.Length) break;
+                Bitmap pufferStamp = GetPufferStamp(puffer);
+                if (pufferStamp == null) continue;
+                trailStamps[trailCount++] = new TrailStamp(pufferStamp, puffer.Pos.X, puffer.Pos.Y, 1f);
+                entityStamps[puffer] = (pufferStamp, puffer.Pos.X, puffer.Pos.Y);
+            }
+            foreach (Bumper bumper in bumpers)
+            {
+                if (trailCount >= trailStamps.Length) break;
+                Bitmap bumperStamp = GetBumperStamp(bumper);
+                if (bumperStamp == null) continue;
+                trailStamps[trailCount++] = new TrailStamp(bumperStamp, bumper.Pos.X, bumper.Pos.Y, 1f);
+                entityStamps[bumper] = (bumperStamp, bumper.Pos.X, bumper.Pos.Y);
+            }
+            seekerParticles.AppendPointStamps(trailStamps, ref trailCount, seekerParticleBitmaps);
+            burstScratch.Clear();
+            AppendPufferOverlays(trailStamps, ref trailCount, burstScratch);
+            AppendDeathBursts(1f / 60f, trailStamps, ref trailCount, burstScratch);
+            if (hitboxesEnabled) AppendActorDebugStamps(ref trailCount);
+            presenter.Present(canvas, canvasChanged, left, top, trailStamps, trailCount, foregroundStart);
+            // Present uploads what it was given, so the burst frames can go now.
+            foreach (Bitmap burst in burstScratch) burst.Dispose();
+            burstScratch.Clear();
+
+            // The entity windows are placed on whole game pixels rather than at the precision
+            // their positions carry, so that they line up with the sprite the presenter draws
+            // at Math.Round(pos) -- which is what makes the shapes below fit them exactly.
+            lock (gliderWindowLock)
+            {
+                foreach (var pair in gliderWindows)
+                {
+                    if (!pair.Value.IsHandleCreated) continue;
+                    int jellyLeft = ((int)Math.Round(pair.Key.Pos.X) - 10) * s;
+                    int jellyTop = ((int)Math.Round(pair.Key.Pos.Y) - 16) * s;
+                    PlaceWindow(pair.Value.Handle, jellyLeft, jellyTop, 20 * s, 22 * s);
+                    pair.Value.HitMask = ShapeEntityWindow(pair.Value.Handle, pair.Key,
+                        jellyLeft, jellyTop, 20, 22, s, pair.Value.HitMask);
+                }
+            }
+            lock (seekerWindowLock)
+            {
+                foreach (var pair in seekerWindows)
+                {
+                    if (!pair.Value.IsHandleCreated) continue;
+                    int seekerLeft = ((int)Math.Round(pair.Key.Pos.X) - 16) * s;
+                    int seekerTop = ((int)Math.Round(pair.Key.Pos.Y) - 16) * s;
+                    PlaceWindow(pair.Value.Handle, seekerLeft, seekerTop, 32 * s, 32 * s);
+                    pair.Value.HitMask = ShapeEntityWindow(pair.Value.Handle, pair.Key,
+                        seekerLeft, seekerTop, 32, 32, s, pair.Value.HitMask);
+                }
+            }
+            lock (pufferWindowLock)
+            {
+                foreach (var pair in pufferWindows)
+                {
+                    if (!pair.Value.IsHandleCreated) continue;
+                    int pufferLeft = ((int)Math.Round(pair.Key.Pos.X) - 12) * s;
+                    int pufferTop = ((int)Math.Round(pair.Key.Pos.Y) - 12) * s;
+                    PlaceWindow(pair.Value.Handle, pufferLeft, pufferTop, 24 * s, 24 * s);
+                    pair.Value.HitMask = ShapeEntityWindow(pair.Value.Handle, pair.Key,
+                        pufferLeft, pufferTop, 24, 24, s, pair.Value.HitMask);
+                }
+            }
+            lock (bumperWindowLock)
+            {
+                foreach (var pair in bumperWindows)
+                {
+                    if (!pair.Value.IsHandleCreated) continue;
+                    int bumperLeft = ((int)Math.Round(pair.Key.Pos.X) - 16) * s;
+                    int bumperTop = ((int)Math.Round(pair.Key.Pos.Y) - 16) * s;
+                    PlaceWindow(pair.Value.Handle, bumperLeft, bumperTop, 32 * s, 32 * s);
+                    pair.Value.HitMask = ShapeEntityWindow(pair.Value.Handle, pair.Key,
+                        bumperLeft, bumperTop, 32, 32, s, pair.Value.HitMask);
+                }
+            }
+            lock (theoWindowLock)
+            {
+                foreach (var pair in theoWindows)
+                {
+                    if (!pair.Value.IsHandleCreated) continue;
+                    int theoLeft = ((int)Math.Round(pair.Key.Pos.X) - 8) * s;
+                    int theoTop = ((int)Math.Round(pair.Key.Pos.Y) - 16) * s;
+                    PlaceWindow(pair.Value.Handle, theoLeft, theoTop, 16 * s, 22 * s);
+                    pair.Value.HitMask = ShapeEntityWindow(pair.Value.Handle, pair.Key,
+                        theoLeft, theoTop, 16, 22, s, pair.Value.HitMask);
+                }
+            }
+
+            // Only this tiny invisible input HWND moves. Rendering belongs to the fixed
+            // click-through composition host, so window movement cannot shake pixels.
+            int inputLeft = (int)Math.Round(player.Pos.X * s) - 12 * s;
+            int inputTop = (int)Math.Round(player.Pos.Y * s) - 30 * s;
+            PlaceWindow(Handle, inputLeft, inputTop, 24 * s, 33 * s);
+            // ...and then loses every part of itself she is not drawn on. The canvas the frame
+            // was drawn into is the same picture the screen just got, so the window's own
+            // corner of it is the shape to take. See HitRegion.
+            HitRegion.Apply(Handle, canvas.Bitmap,
+                new Rectangle((inputLeft - left) / s, (inputTop - top) / s, 24, 33), s,
+                ref playerHitMask);
+            // Log position + speed + state every 5 seconds
+            if ((++renderFrameCount % 300) == 0)
+                PetWindow.Log("frame " + renderFrameCount + " pos=" + player.Pos.X.ToString("F1") + "," + player.Pos.Y.ToString("F1") +
+                    " sp=" + player.Speed.X.ToString("F0") + "," + player.Speed.Y.ToString("F0") +
+                    " st=" + player.State + " duck=" + (player.Ducking ? 1 : 0) + " anim=" + player.AnimId);
+        }
+
+        /// <summary>
+        /// Put an input window at a rectangle, unless it is exactly there already.
+        /// </summary>
+        /// <remarks>
+        /// Most frames nothing has moved, and a SetWindowPos that changes nothing still costs a
+        /// round trip to the thread that owns the window for its WM_WINDOWPOSCHANGING and
+        /// WM_WINDOWPOSCHANGED. Asking where the window is costs no messages at all. A window
+        /// that is anywhere else -- including one something other than this moved -- is put
+        /// back exactly as before.
+        /// </remarks>
+        static void PlaceWindow(IntPtr window, int left, int top, int width, int height)
+        {
+            if (Win32.GetWindowRect(window, out Win32.RECT at) && at.Left == left && at.Top == top &&
+                at.Right == left + width && at.Bottom == top + height)
+                return;
+            Win32.SetWindowPos(window, IntPtr.Zero, left, top, width, height,
+                Win32.SWP_NOACTIVATE | Win32.SWP_NOZORDER);
+        }
+
+        float ComputeCameraX()
+        {
+            // The camera never chases effects. The fixed wide footprint contains them,
+            // so afterimages cannot make the player/window oscillate at high speed.
+            return player.Pos.X - AnchorX;
+        }
+
+        // Vanilla SlashFx: 4 frames x 0.1s, spawned at player Center, moves 8px/s along dash direction.
+        /// <summary>
+        /// One frame of SlashFx, already turned to face the dash, as a stamp of its own.
+        /// </summary>
+        /// <remarks>
+        /// A dash aims one of eight ways and the effect is four frames long, so this is a
+        /// couple of dozen small bitmaps at most; the explode launch can come in at any angle,
+        /// which is what the cap is for. They are drawn at 1x and rotated there, as they were
+        /// when they were drawn straight into the canvas, so the result is the same picture.
+        /// </remarks>
+        Bitmap GetSlashStamp(int frame, float angle)
+        {
+            int key = frame * 1000 + (int)Math.Round(angle * 180.0 / Math.PI);
+            if (slashStamps.TryGetValue(key, out Bitmap cached)) return cached;
+            var tex = Sprites.Get("slash0" + frame, false);
+            if (tex == null) return null;
+            var stamp = new Bitmap(SlashStampSize, SlashStampSize, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(stamp))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                g.CompositingQuality = CompositingQuality.HighSpeed;
+                g.TranslateTransform(SlashStampSize / 2f, SlashStampSize / 2f);
+                // SlashFx deliberately leaves the source orientation unchanged for exactly PI.
+                if (Math.Abs(angle - (float)Math.PI) > 0.01f)
+                    g.RotateTransform(angle * 180f / (float)Math.PI);
+                g.DrawImage(tex, -12, -4, 24, 8);
+            }
+            if (slashStamps.Count > 64)
+            {
+                foreach (Bitmap old in slashStamps.Values) old.Dispose();
+                slashStamps.Clear();
+            }
+            slashStamps[key] = stamp;
+            return stamp;
+        }
+
+        void DrawGliders(Graphics g, float camX, float camY, bool heldOnly = false)
+        {
+            foreach (Glider glider in gliders)
+            {
+                if (heldOnly && !glider.IsHeld) continue;
+                Bitmap frame = Sprites.Get(glider.FrameId, false);
+                if (frame == null) continue;
+                var state = g.Save();
+                g.TranslateTransform(SnapPx(glider.Pos.X - camX), SnapPx(glider.Pos.Y - camY));
+                g.RotateTransform(glider.Rotation * 180f / (float)Math.PI);
+                float w = 48f * glider.ScaleX, h = 48f * glider.ScaleY;
+                // Vanilla Sprites.xml: <Justify x="0.5" y="0.58"/>.
+                // Rotation and scale are around that origin, not the frame center.
+                float x = -24f * glider.ScaleX;
+                float y = -27.84f * glider.ScaleY;
+                // Glider.Render calls DrawSimpleOutline before drawing the sprite.
+                Sprites.DrawSilhouette(g, frame, Color.Black, x - 1f, y, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x + 1f, y, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x, y - 1f, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x, y + 1f, w, h);
+                g.DrawImage(frame, x, y, w, h);
+                g.Restore(state);
+            }
+        }
+
+        void DrawTheos(Graphics g, float camX, float camY, bool heldOnly = false)
+        {
+            foreach (TheoCrystal theo in theos)
+            {
+                if (theo.Removed) continue;
+                // A breaking crystal is a burst rather than a sprite, and the burst is a stamp:
+                // see AppendDeathBursts, which puts it in the world rather than on the canvas.
+                if (theo.IsDying) continue;
+                if (heldOnly && !theo.IsHeld) continue;
+                Bitmap frame = Sprites.Get(theo.FrameId, true);
+                if (frame == null) continue;
+                // Sprites.xml: <Origin x="32" y="42"/>.
+                g.DrawImage(frame, SnapPx(theo.Pos.X - camX) - 32f,
+                    SnapPx(theo.Pos.Y - camY) - 42f, 64f, 64f);
+            }
+        }
+
+        void DrawPreDeath(Graphics g, float camX, float camY)
+        {
+            float dx = player.DeathBodyPosition.X - player.Pos.X;
+            float dy = player.DeathBodyPosition.Y - player.Pos.Y;
+            DrawHair(g, camX - dx, camY - dy,
+                player.DeathBodyFrameId != null && player.DeathBodyFrameId.EndsWith("00")
+                    ? Color.White : player.DeathColor);
+            Bitmap frame = Sprites.Get(player.DeathBodyFrameId, player.Facing < 0);
+            if (frame == null) return;
+            var state = g.Save();
+            g.TranslateTransform(SnapPx(player.DeathBodyPosition.X - camX),
+                SnapPx(player.DeathBodyPosition.Y - camY));
+            g.RotateTransform(player.DeathBodyRotation * 180f / (float)Math.PI);
+            g.ScaleTransform(player.DeathBodyScale, player.DeathBodyScale);
+            g.DrawImage(frame, -16f, -32f, 32f, 32f);
+            g.Restore(state);
+        }
+
+        /// <summary>A burst left behind by something that is already gone.</summary>
+        /// <remarks>
+        /// Vanilla adds the DeathEffect to an entity of its own and removes the seeker at once,
+        /// so nothing of it is left to be collided with while the burst plays. The same here,
+        /// and for the same reason: a seeker that lingered for the duration of its own death
+        /// would still be solid, still dangerous, and still in the way.
+        ///
+        /// They are drawn as stamps rather than onto the canvas because the canvas is a
+        /// thousand pixels wide and anchored to Madeline, and a seeker crushed at the far end
+        /// of the desktop is a long way outside it. Her own death effect stays on the canvas,
+        /// the canvas being centred on her by definition.
+        /// </remarks>
+        sealed class DeathBurst
+        {
+            public PointF Pos;
+            public Color Colour;
+            public float Age;
+        }
+
+        readonly List<DeathBurst> deathBursts = new List<DeathBurst>();
+        const float DeathBurstDuration = 0.834f;    // DeathEffect.Duration
+
+        void AddDeathBurst(PointF pos, Color colour)
+            => deathBursts.Add(new DeathBurst { Pos = pos, Colour = colour });
+
+        /// <summary>Age the bursts, and hand each one to the presenter as its own stamp.</summary>
+        void AppendDeathBursts(float dt, TrailStamp[] stamps, ref int count, List<Bitmap> scratch)
+        {
+            for (int i = deathBursts.Count - 1; i >= 0; i--)
+            {
+                deathBursts[i].Age += dt;
+                if (deathBursts[i].Age >= DeathBurstDuration) deathBursts.RemoveAt(i);
+            }
+            foreach (DeathBurst burst in deathBursts)
+            {
+                if (count >= stamps.Length) break;
+                Bitmap bitmap = MakeBurst(burst.Colour, Math.Min(1f, burst.Age / DeathBurstDuration),
+                    burst.Pos);
+                stamps[count++] = new TrailStamp(bitmap, burst.Pos.X, burst.Pos.Y, 1f);
+                scratch.Add(bitmap);
+            }
+            // The crystal keeps its own burst, vanilla leaving it alive with its sprite hidden
+            // rather than removing it, but it is drawn the same way and for the same reason.
+            foreach (TheoCrystal theo in theos)
+            {
+                if (!theo.IsDying || count >= stamps.Length) continue;
+                Bitmap bitmap = MakeBurst(Color.ForestGreen, theo.DeathPercent, theo.DeathPosition);
+                stamps[count++] = new TrailStamp(bitmap, theo.DeathPosition.X, theo.DeathPosition.Y, 1f);
+                scratch.Add(bitmap);
+            }
+        }
+
+        /// <summary>One frame of a burst, on a canvas of its own to be stamped into the world.</summary>
+        Bitmap MakeBurst(Color colour, float percent, PointF at)
+        {
+            var bitmap = new Bitmap(DeathBurstSize, DeathBurstSize, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bitmap))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                // Centred by putting the camera half a stamp up and to the left of it.
+                DrawDeathEffect(g, at.X - DeathBurstSize / 2f, at.Y - DeathBurstSize / 2f,
+                    at, colour, percent);
+            }
+            return bitmap;
+        }
+
+        /// <summary>Wide enough for the burst at full spread: radius 24 plus a 10px blob.</summary>
+        const int DeathBurstSize = 64;
+        readonly List<Bitmap> burstScratch = new List<Bitmap>();
+
+        Bitmap GetGliderStamp(Glider glider)
+        {
+            Bitmap frame = Sprites.Get(glider.FrameId, false);
+            if (frame == null) return null;
+            int rotation = (int)Math.Round(glider.Rotation * 180f / Math.PI);
+            int scaleX = (int)Math.Round(glider.ScaleX * 100f);
+            int scaleY = (int)Math.Round(glider.ScaleY * 100f);
+            if (gliderStampCache.TryGetValue(glider, out var cached) &&
+                cached.FrameId == glider.FrameId && cached.Rotation == rotation &&
+                cached.ScaleX == scaleX && cached.ScaleY == scaleY)
+                return cached.Bitmap;
+
+            var bitmap = new Bitmap(64, 64, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bitmap))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                var state = g.Save();
+                g.TranslateTransform(32f, 32f);
+                g.RotateTransform(rotation);
+                float w = 48f * glider.ScaleX, h = 48f * glider.ScaleY;
+                float x = -24f * glider.ScaleX;
+                float y = -27.84f * glider.ScaleY;
+                Sprites.DrawSilhouette(g, frame, Color.Black, x - 1f, y, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x + 1f, y, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x, y - 1f, w, h);
+                Sprites.DrawSilhouette(g, frame, Color.Black, x, y + 1f, w, h);
+                g.DrawImage(frame, x, y, w, h);
+                g.Restore(state);
+            }
+            if (cached == null)
+            {
+                cached = new GliderStampCache();
+                gliderStampCache[glider] = cached;
+            }
+            // The presenter has already uploaded the previous frame on the prior
+            // Present. It no longer needs the CPU bitmap after this replacement.
+            cached.Bitmap?.Dispose();
+            cached.FrameId = glider.FrameId;
+            cached.Rotation = rotation;
+            cached.ScaleX = scaleX;
+            cached.ScaleY = scaleY;
+            cached.Bitmap = bitmap;
+            return bitmap;
+        }
+
+        /// <summary>Everything above the sprite an alerted puffer draws: its arc, and its eye.</summary>
+        /// <remarks>
+        /// Not part of the stamp above, and not cached: the arc shimmers, bends towards her and
+        /// fades with how near she is, so it is different on every frame there is. It is built
+        /// and thrown away like a death burst, which is drawn the same way for the same reason.
+        /// </remarks>
+        void AppendPufferOverlays(TrailStamp[] stamps, ref int count, List<Bitmap> scratch)
+        {
+            foreach (Puffer puffer in puffers)
+            {
+                if (count >= stamps.Length) break;
+                int marks = puffer.AggroArc(pufferArcAt, pufferArcIn, pufferArcAlpha);
+                bool eye = puffer.HasEye;
+                if (marks == 0 && !eye) continue;
+
+                var bitmap = new Bitmap(128, 128, PixelFormat.Format32bppPArgb);
+                // Everything lands on the world's own pixel grid, the way the game's
+                // rasterizer lands it: floored in world space, and only then moved into the
+                // stamp by the same rounded anchor the presenter hangs the stamp on. Flooring
+                // against the fractional position instead put that fraction into the sum twice
+                // with different roundings, and every mark slid a pixel to and fro as the fish
+                // wandered -- a boil of white specks where the game shows a nearly still arc.
+                int anchorX = (int)Math.Round(puffer.Pos.X), anchorY = (int)Math.Round(puffer.Pos.Y);
+                using (var g = Graphics.FromImage(bitmap))
+                {
+                    g.SmoothingMode = SmoothingMode.None;
+                    g.PixelOffsetMode = PixelOffsetMode.Half;
+                    for (int i = 0; i < marks; i++)
+                    {
+                        float x = (float)Math.Floor(pufferArcAt[i].X) - anchorX + 64f;
+                        float y = (float)Math.Floor(pufferArcAt[i].Y) - anchorY + 64f;
+                        int alpha = (int)Math.Round(Math.Clamp(pufferArcAlpha[i], 0f, 1f) * 255f);
+                        if (alpha <= 0) continue;
+                        using var brush = new SolidBrush(Color.FromArgb(alpha, Color.White));
+                        if (pufferArcIn[i].IsEmpty) g.FillRectangle(brush, x, y, 1f, 1f);
+                        else
+                        {
+                            using var pen = new Pen(brush.Color);
+                            g.DrawLine(pen, x, y, x - pufferArcIn[i].X, y - pufferArcIn[i].Y);
+                        }
+                    }
+                    if (eye)
+                    {
+                        PointF at = puffer.Eye;
+                        using var black = new SolidBrush(Color.Black);
+                        g.FillRectangle(black,
+                            (float)Math.Floor(at.X) - anchorX + 64f,
+                            (float)Math.Floor(at.Y) - anchorY + 64f, 1f, 1f);
+                    }
+                }
+                stamps[count++] = new TrailStamp(bitmap, puffer.Pos.X, puffer.Pos.Y, 1f);
+                scratch.Add(bitmap);
+            }
+        }
+
+        readonly PointF[] pufferArcAt = new PointF[28];
+        readonly PointF[] pufferArcIn = new PointF[28];
+        readonly float[] pufferArcAlpha = new float[28];
+
+        /// <summary>The four ways an outline is offset, and the matrix that blacks a sprite out.</summary>
+        static readonly Point[] OutlineSteps =
+            { new Point(-1, 0), new Point(0, -1), new Point(1, 0), new Point(0, 1) };
+
+        static readonly ColorMatrix BlackenSprite = new ColorMatrix(new[]
+        {
+            new[] { 0f, 0f, 0f, 0f, 0f },
+            new[] { 0f, 0f, 0f, 0f, 0f },
+            new[] { 0f, 0f, 0f, 0f, 0f },
+            new[] { 0f, 0f, 0f, 1f, 0f },
+            new[] { 0f, 0f, 0f, 0f, 1f },
+        });
+
+        /// <summary>
+        /// The puffer's frame: centred, and carrying the squash of a bounce and the turn
+        /// of its wobble, which are Sprite.Scale and Sprite.Rotation in the game.
+        /// </summary>
+        Bitmap GetPufferStamp(Puffer puffer)
+        {
+            string frameId = puffer.FrameId;
+            PointF scale = puffer.Scale;
+            int sx = (int)Math.Round(scale.X * puffer.Facing * 100f);
+            int sy = (int)Math.Round(scale.Y * 100f);
+            int turn = (int)Math.Round(puffer.Rotation * 180f / Math.PI);
+            bool outlined = puffer.Outlined;
+            string key = frameId + (outlined ? "+" : "");
+            if (pufferStampCache.TryGetValue(puffer, out GliderStampCache cached) &&
+                cached.FrameId == key && cached.ScaleX == sx && cached.ScaleY == sy &&
+                cached.Rotation == turn) return cached.Bitmap;
+            Bitmap frame = Sprites.Get(frameId, puffer.Facing < 0);
+            Bitmap bitmap = null;
+            if (frame != null)
+            {
+                bitmap = new Bitmap(128, 128, PixelFormat.Format32bppPArgb);
+                using var g = Graphics.FromImage(bitmap);
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                bool plain = turn == 0 && sx == 100 * (puffer.Facing < 0 ? -1 : 1) && sy == 100;
+                if (plain) g.TranslateTransform(64f, 64f);
+                else
+                {
+                    g.TranslateTransform(64f, 64f);
+                    g.RotateTransform(turn);
+                    g.ScaleTransform(Math.Abs(scale.X), Math.Abs(scale.Y));
+                }
+                float ox = -frame.Width / 2f, oy = -frame.Height / 2f;
+                // GraphicsComponent.DrawSimpleOutline: the same sprite in black, a pixel
+                // out in each of the four directions, and then the sprite over the top.
+                if (outlined)
+                {
+                    using var black = new ImageAttributes();
+                    black.SetColorMatrix(BlackenSprite);
+                    var whole = new Rectangle(0, 0, frame.Width, frame.Height);
+                    foreach (Point step in OutlineSteps)
+                        g.DrawImage(frame,
+                            new Rectangle((int)ox + step.X, (int)oy + step.Y,
+                                frame.Width, frame.Height),
+                            0, 0, frame.Width, frame.Height, GraphicsUnit.Pixel, black);
+                }
+                g.DrawImage(frame, ox, oy, frame.Width, frame.Height);
+            }
+            cached ??= new GliderStampCache();
+            cached.Bitmap?.Dispose();
+            cached.FrameId = key; cached.ScaleX = sx; cached.ScaleY = sy;
+            cached.Rotation = turn; cached.Bitmap = bitmap;
+            pufferStampCache[puffer] = cached;
+            return bitmap;
+        }
+
+        /// <summary>
+        /// The bumper's frame, centred: its sprite is a <Center/> in the game's own definition,
+        /// so the 64x64 frame hangs half either side of where it is.
+        /// </summary>
+        Bitmap GetBumperStamp(Bumper bumper)
+        {
+            string frameId = bumper.FrameId;
+            if (bumperStampCache.TryGetValue(bumper, out GliderStampCache cached) &&
+                cached.FrameId == frameId) return cached.Bitmap;
+            Bitmap frame = Sprites.Get(frameId, false);
+            Bitmap bitmap = null;
+            if (frame != null)
+            {
+                bitmap = new Bitmap(128, 128, PixelFormat.Format32bppPArgb);
+                using var g = Graphics.FromImage(bitmap);
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.DrawImage(frame, 64f - frame.Width / 2f, 64f - frame.Height / 2f,
+                    frame.Width, frame.Height);
+            }
+            cached ??= new GliderStampCache();
+            cached.Bitmap?.Dispose();
+            cached.FrameId = frameId;
+            cached.Bitmap = bitmap;
+            bumperStampCache[bumper] = cached;
+            return bitmap;
+        }
+
+        Bitmap GetSeekerStamp(Seeker seeker)
+        {
+            string frameId = seeker.FrameId;
+            int sx = (int)Math.Round(seeker.RenderScaleX * 100f);
+            int sy = (int)Math.Round(seeker.RenderScaleY * 100f);
+            int facing = seeker.SpriteFacing;
+            if (seekerStampCache.TryGetValue(seeker, out GliderStampCache cached) &&
+                cached.FrameId == frameId && cached.ScaleX == sx && cached.ScaleY == sy &&
+                cached.Rotation == facing) return cached.Bitmap;
+            Bitmap bitmap = CreateSeekerStamp(frameId, facing, seeker.RenderScaleX, seeker.RenderScaleY, false);
+            cached ??= new GliderStampCache();
+            cached.Bitmap?.Dispose();
+            cached.FrameId = frameId; cached.ScaleX = sx; cached.ScaleY = sy;
+            cached.Rotation = facing; cached.Bitmap = bitmap;
+            seekerStampCache[seeker] = cached;
+            return bitmap;
+        }
+
+        static Bitmap CreateSeekerStamp(string frameId, int facing, float scaleX, float scaleY, bool trail)
+        {
+            Bitmap frame = Sprites.Get(frameId, facing < 0);
+            if (frame == null) return null;
+            var bitmap = new Bitmap(128, 128, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bitmap))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.SmoothingMode = SmoothingMode.None;
+                float w = frame.Width * scaleX, h = frame.Height * scaleY;
+                float x = 64f - w / 2f, y = 64f - h / 2f;
+                if (trail) Sprites.DrawSilhouette(g, frame, Seeker.TrailColor, x, y, w, h);
+                else g.DrawImage(frame, x, y, w, h);
+            }
+            return bitmap;
+        }
+
+        /// <summary>
+        /// Player.Render's Sprite.Color: red on the low-stamina flash, white otherwise -- through
+        /// SkinModHelper's patches, which can recolour the flash and dress a silhouette in her hair.
+        /// Decided before the hair is drawn, as the game decides it, because the flash can grade
+        /// the hair too.
+        /// </summary>
+        Color BodyColor()
+        {
+            SmhSkin skin = player.Skin;
+            if (skin != null)
+            {
+                // HairConfig.OnHairUpdate: the grading lasts only the frame it was set on.
+                skin.Hair.HairColorGrading = null;
+                skin.ChooseColorGrade(player.ColorGradeDashCount, skin.Hair.HairFlashing);
+            }
+            if (player.IsLowStamina && tiredFlash) return skin?.LowStaminaFlash(player.HairColor) ?? Color.Red;
+            return skin?.Character.SilhouetteMode == true ? player.HairColor : Color.White;
+        }
+
+        void DrawBody(Graphics g, float anchorX, float anchorY, Color bodyColor)
+        {
+            // Image.Render: the frame around the sprite's origin, Sprite.Scale.X carrying her facing,
+            // so that facing left mirrors the frame about its origin. Snapped to whole game pixels.
+            bool flip = player.Facing < 0;
+            var frame = Sprites.Get(player.CurrentFrameId, flip);
+            if (frame != null)
+            {
+                SmhSkin skin = player.Skin;
+                PointF origin = player.Sprite.OriginFor(frame.Width, frame.Height);
+                float sx = player.SpriteScaleX, sy = player.SpriteScaleY;
+                float left = flip ? anchorX - (frame.Width - origin.X) * sx : anchorX - origin.X * sx;
+                float x = SnapPx(left), y = SnapPx(anchorY - origin.Y * sy);
+                float w = SnapPx(frame.Width * sx), h = SnapPx(frame.Height * sy);
+                // SpriteRenderHook_ColorGrade: the frame through the grade, and MixHair's tint of
+                // the mask colour when TintMaskWithHair is on.
+                Bitmap grade = skin?.CurrentGrade == null ? null : Sprites.Get(skin.CurrentGrade, false);
+                Color? mix = skin?.Character.TintMaskWithHair == true
+                    ? (player.HairColor.ToArgb() != bodyColor.ToArgb() ? player.HairColor : Color.White)
+                    : (Color?)null;
+                bool after = skin?.Character.ColorGradingAfterColored == true && grade != null;
+                frame = SmhShader.Apply(frame, grade, after, bodyColor, mix, skin?.Character.MaskMode ?? 0);
+                Color tint = after ? Color.White : bodyColor;
+                if (tint.ToArgb() != Color.White.ToArgb())
+                    Sprites.DrawTinted(g, frame, tint, x, y, w, h);
+                else
+                {
+                    g.DrawImage(frame, x, y, w, h);
+                    // A pose with its hair painted in -- sleeping, mostly -- wears whatever
+                    // colour her hair is, rather than the red it was drawn in. Nothing here
+                    // for an ordinary frame: the mask is null and asked for only once.
+                    Bitmap paintedHair = Sprites.BakedHairMask(player.CurrentFrameId, flip);
+                    if (paintedHair != null)
+                        Sprites.DrawTinted(g, paintedHair, player.HairColor, x, y, w, h);
+                }
+            }
+        }
+
+        /// <summary>
+        /// <c>GrabbyIcon.Render</c>: util/glove justified (0.5, 1) at 16px above her feet, scaled
+        /// by the wiggler. Depth -1000001 puts it over everything, particles included. A dead
+        /// player is no longer in the tracker, so nothing is drawn for one.
+        /// </summary>
+        void DrawGrabbyIcon(Graphics g, float anchorX, float anchorY)
+        {
+            if (!grabbyIcon.Enabled || player.IsDead || player.IsPreDeath) return;
+            Bitmap glove = Sprites.Get("glove", false);
+            if (glove == null) return;
+            float scale = grabbyIcon.Scale;
+            float w = glove.Width * scale, h = glove.Height * scale;
+            // Snapped the way DrawBody snaps a squashed frame.
+            g.DrawImage(glove, SnapPx(SnapPx(anchorX) - w * 0.5f), SnapPx(SnapPx(anchorY) - 16f - h),
+                SnapPx(w), SnapPx(h));
+        }
+
+        /// <summary>
+        /// SkinModHelper's death effect: its DeathParticleColor and death_particle texture, the
+        /// one or the other, over the game's.
+        /// </summary>
+        /// <param name="respawn">
+        /// DeathEffectDrawHook, which falls back to the skin's hair colour for her dashes, where
+        /// the dead body's burst keeps the colour it was made with.
+        /// </param>
+        (string Texture, Color Color) SkinDeathEffect(Color color, bool respawn)
+        {
+            SmhSkin skin = player.Skin;
+            string texture = "characters/player/hair00";
+            if (skin == null) return (texture, color);
+            if (Smh.RGB_IsMatch(skin.Character.DeathParticleColor))
+                color = respawn ? Smh.HexToColor(skin.Character.DeathParticleColor)
+                    : Smh.Mul(Smh.HexToColor(skin.Character.DeathParticleColor), Smh.GetAlpha(color));
+            else if (respawn && skin.Hair.SafeGetHairColor(player.SkinDashCount, out Color hair))
+                color = hair;
+            if (skin.TextureOnSprite("death_particle", out string particle)) texture = particle;
+            return (texture, color);
+        }
+
+        void DrawDeathEffect(Graphics g, float camX, float camY,
+            PointF effectPosition, Color effectColor, float effectPercent, string texturePath = "characters/player/hair00")
+        {
+            Bitmap texture = Sprites.Get(texturePath, false) ?? Sprites.Get("hair00", false);
+            if (texture == null) return;
+            float ease = effectPercent;
+            float cubeOut = 1f - (float)Math.Pow(1f - ease, 3f);
+            float radius = cubeOut * 24f;
+            float scale = ease < 0.5f
+                ? 0.5f + ease
+                : 1f - (float)Math.Pow((ease - 0.5f) * 2f, 3f);
+            Color color = ((int)Math.Floor(ease * 10f) & 1) == 0
+                ? effectColor : Color.White;
+            float centerX = effectPosition.X - camX;
+            float centerY = effectPosition.Y - camY;
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = ((float)i / 8f + ease * 0.25f) * (float)Math.PI * 2f;
+                float x = SnapPx(centerX + (float)Math.Cos(angle) * radius);
+                float y = SnapPx(centerY + (float)Math.Sin(angle) * radius);
+                float w = SnapEven(texture.Width * scale), h = SnapEven(texture.Height * scale);
+                Sprites.DrawTinted(g, texture, Color.Black, x - w / 2f - 1f, y - h / 2f, w, h);
+                Sprites.DrawTinted(g, texture, Color.Black, x - w / 2f + 1f, y - h / 2f, w, h);
+                Sprites.DrawTinted(g, texture, Color.Black, x - w / 2f, y - h / 2f - 1f, w, h);
+                Sprites.DrawTinted(g, texture, Color.Black, x - w / 2f, y - h / 2f + 1f, w, h);
+            }
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = ((float)i / 8f + ease * 0.25f) * (float)Math.PI * 2f;
+                float x = SnapPx(centerX + (float)Math.Cos(angle) * radius);
+                float y = SnapPx(centerY + (float)Math.Sin(angle) * radius);
+                float w = SnapEven(texture.Width * scale), h = SnapEven(texture.Height * scale);
+                Sprites.DrawTinted(g, texture, color, x - w / 2f, y - h / 2f, w, h);
+            }
+        }
+
+        void DrawSweat(Graphics g, float anchorX, float anchorY)
+        {
+            if (introWakeUp) return;
+            var sweat = Sprites.Get(sweatSprite.Texture, player.Facing < 0);
+            if (sweat != null)
+            {
+                float sx = player.SpriteScaleX, sy = player.SpriteScaleY;
+                float x = SnapPx(anchorX - 16 * sx), y = SnapPx(anchorY - 32 * sy);
+                g.DrawImage(sweat, x, y, SnapPx(32 * sx), SnapPx(32 * sy));
+            }
+        }
+
+        void DrawWavedashWaves(Graphics g, float camX, float camY)
+        {
+            foreach (var ring in waveRings)
+            {
+                float alpha = 0.6f * (1f - ring.Progress);
+                int a = Math.Max(0, Math.Min(255, (int)Math.Round(alpha * 255f)));
+                using var pen = new Pen(Color.FromArgb(a, Color.White), 1f);
+                var points = new PointF[16];
+                float maxRadius = 4f + (14f - 4f) * ring.Progress;
+                float nx = (float)Math.Cos(ring.Angle), ny = (float)Math.Sin(ring.Angle);
+                for (int i = 0; i < points.Length; i++)
+                {
+                    float radians = i * (float)Math.PI * 2f / points.Length;
+                    float vx = (float)Math.Cos(radians), vy = (float)Math.Sin(radians);
+                    float along = Math.Abs(vx * nx + vy * ny);
+                    float radius = maxRadius * (1f - 0.5f * along);
+                    points[i] = new PointF(
+                        SnapPx(ring.X - camX + vx * radius),
+                        SnapPx(ring.Y - camY + vy * radius));
+                }
+                g.DrawPolygon(pen, points);
+            }
+        }
+
+        void DrawHair(Graphics g, float camX, float camY, Color? colorOverride = null)
+            => DrawHairPlan(g, BuildHairPlan(colorOverride), camX, camY);
+
+        /// <summary>One piece of hair as PlayerHair.Render draws it.</summary>
+        struct HairPiece
+        {
+            public string Texture;
+            public PointF Node, Scale, Origin;
+            public Color Fill;
+        }
+
+        /// <summary>Her hair as it stands this frame: every piece, and the outline around them.</summary>
+        sealed class HairPlan
+        {
+            public HairPiece[] Pieces;
+            public Color Border;
+            /// <summary>The colour grade the hair is drawn through, and in which technique.</summary>
+            public Bitmap Grade;
+            public bool GradeAfterColored;
+        }
+
+        /// <summary>
+        /// PlayerHair.Render's choices for this frame -- each segment's texture, colour, scale and
+        /// origin, and the outline's colour -- through SkinModHelper's hooks on all of them when
+        /// a skin of its is worn.
+        /// </summary>
+        HairPlan BuildHairPlan(Color? colorOverride = null)
+        {
+            var hair = player.Hair;
+            SmhSkin skin = player.Skin;
+            SmhHair smh = skin?.Hair;
+            int count = Math.Min(hair.ActiveCount, hair.Nodes.Count);
+            HairMeta.TryGet(player.CurrentFrameId, out var meta);
+            int hairFrame = meta.Bangs;
+
+            // PlayerHair.Color and Border, as PlayerHairRenderHook leaves them.
+            Color color = colorOverride ?? player.HairColor;
+            Color border = smh?.Border ?? Color.Black;
+            if (smh?.LastDashes is int lastDashes)
+            {
+                if (!smh.HairFlashing && smh.SafeGetHairColor(lastDashes, out Color general)) color = general;
+                if (smh.GetHairColorWithSpecified((int)SmhHair.Special.Outline, lastDashes, out Color outline)) border = outline;
+            }
+            if (skin != null && skin.Character.TintMaskWithHair)
+            {
+                int sum = border.R + border.G + border.B;
+                int mode = skin.Character.MaskMode;
+                if (mode > 2)
+                {
+                    if (border.R == border.B && border.R == border.G) border = Smh.ColorBlend(border, color);
+                }
+                else if (sum == new[] { border.R, border.G, border.B }[mode])
+                    border = Smh.ColorBlend(Color.FromArgb(border.A, Math.Min(255, sum), Math.Min(255, sum), Math.Min(255, sum)), color);
+                border = Smh.ColorBlend(border, color);
+            }
+            if (smh != null) border = Smh.ColorBlend(border, smh.HairColorGrading);
+            if (skin?.Character.SilhouetteMode == true && smh.LastDashes != SmhHair.FeatherIndex)
+                border = Smh.ColorBlend(border, color);
+
+            // PlayerHair.bangs is characters/player/bangs; the hair, characters/player/hair00.
+            var vanillaBangs = AtlasLookup.Subtextures(Sprites.Atlas, "characters/player/bangs");
+            string bangs = vanillaBangs.Count > hairFrame ? vanillaBangs[hairFrame] : HairMeta.BangsFrames[Math.Max(0, Math.Min(2, hairFrame))];
+            const string hairTexture = "characters/player/hair00";
+
+            var pieces = new HairPiece[count];
+            for (int i = 0; i < count; i++)
+            {
+                string texture = skin != null
+                    ? skin.GetHairTexture(i, hairFrame, count, player.CurrentFrameId, bangs, hairTexture)
+                    : i == 0 ? bangs : hairTexture;
+                // Desktop: the cat bangs stand in for the game's, never for a skin's own.
+                if (i == 0 && catBangsEnabled && texture == bangs)
+                    texture = "catbangs" + hairFrame.ToString("00");
+
+                // PlayerHair.GetHairScale, through PlayerHairGetHairScaleHook.
+                float num = 0.25f + (1f - (float)i / count) * 0.75f;
+                var scale = new PointF((i == 0 ? player.Facing : num) * Math.Abs(player.SpriteScaleX), num);
+                if (smh?.LastDashes is int dashes)
+                {
+                    if (smh.GetHairScale(i, dashes, count, player.SpriteScaleX, out PointF custom))
+                        scale = new PointF((float)Math.Round(custom.X, 2), (float)Math.Round(custom.Y, 2));
+                    scale = smh.FlipHair(scale, i, player.Facing, hair.Nodes);
+                }
+
+                // PlayerHair.GetHairColor, through PlayerHairGetHairColorHook.
+                Color fill = color;
+                if (smh != null)
+                {
+                    if (smh.ActualHairColors != null && smh.LastDashes is int d && !smh.HairFlashing &&
+                        smh.SafeGetHairColor(i, d, count, out Color segment))
+                        fill = Smh.ColorBlend(segment, smh.HairColorGrading);
+                    else fill = Smh.ColorBlend(color, smh.HairColorGrading);
+                }
+
+                pieces[i] = new HairPiece
+                {
+                    Texture = texture,
+                    Node = hair.Nodes[i],
+                    Scale = scale,
+                    Origin = smh == null ? new PointF(5f, 5f) : i == 0 ? smh.BangsOrigin : smh.HairOrigin,
+                    Fill = fill,
+                };
+            }
+            return new HairPlan
+            {
+                Pieces = pieces,
+                Border = border,
+                Grade = skin?.CurrentGrade == null ? null : Sprites.Get(skin.CurrentGrade, false),
+                GradeAfterColored = skin?.Character.ColorGradingAfterColored == true,
+            };
+        }
+
+        /// <summary>
+        /// PlayerHair.Render: the outline, every piece offset a pixel four ways, then the pieces
+        /// themselves from the end of the hair to the bangs. The root lands on a whole pixel, as
+        /// Nodes[0].Floor() puts it, and the rest keep their places relative to it.
+        /// </summary>
+        void DrawHairPlan(Graphics g, HairPlan plan, float camX, float camY)
+        {
+            if (plan.Pieces.Length == 0) return;
+            float rootX = SnapPx(plan.Pieces[0].Node.X - camX);
+            float rootY = SnapPx(plan.Pieces[0].Node.Y - camY);
+            PointF At(HairPiece p) => new PointF(rootX + p.Node.X - plan.Pieces[0].Node.X, rootY + p.Node.Y - plan.Pieces[0].Node.Y);
+            if (plan.Border.A > 0)
+                foreach (HairPiece p in plan.Pieces)
+                {
+                    PointF at = At(p);
+                    DrawHairTexture(g, plan, p, at.X - 1, at.Y, plan.Border);
+                    DrawHairTexture(g, plan, p, at.X + 1, at.Y, plan.Border);
+                    DrawHairTexture(g, plan, p, at.X, at.Y - 1, plan.Border);
+                    DrawHairTexture(g, plan, p, at.X, at.Y + 1, plan.Border);
+                }
+            for (int i = plan.Pieces.Length - 1; i >= 0; i--)
+            {
+                PointF at = At(plan.Pieces[i]);
+                DrawHairTexture(g, plan, plan.Pieces[i], at.X, at.Y, plan.Pieces[i].Fill);
+            }
+        }
+
+        /// <summary>MTexture.Draw(position, origin, color, scale), a negative X scale mirroring it.</summary>
+        static void DrawHairTexture(Graphics g, HairPlan plan, HairPiece piece, float x, float y, Color color)
+        {
+            bool flip = piece.Scale.X < 0f;
+            Bitmap texture = Sprites.Get(piece.Texture, flip);
+            if (texture == null) return;
+            // PlayerHairRenderHook_ColorGrade: the whole of the hair, outline too, through the grade.
+            if (plan.Grade != null)
+            {
+                texture = SmhShader.Apply(texture, plan.Grade, plan.GradeAfterColored, color, null, 0);
+                if (plan.GradeAfterColored) color = Color.FromArgb(color.A, 255, 255, 255);
+            }
+            float sx = Math.Abs(piece.Scale.X), sy = piece.Scale.Y;
+            float left = flip ? x - (texture.Width - piece.Origin.X) * sx : x - piece.Origin.X * sx;
+            float top = y - piece.Origin.Y * sy;
+            Sprites.DrawTinted(g, texture, color, left, top, texture.Width * sx, texture.Height * sy, color.A / 255f);
+        }
+
+        void DrawSpeedometer(Graphics g, float camX, float camY)
+        {
+            if (speedometerMode == 0 || picoDigits[0] == null || introWakeUp) return;
+            double speed = speedometerMode switch
+            {
+                1 => Math.Abs(Math.Round(player.Speed.X)),
+                2 => Math.Abs(Math.Round(player.Speed.Y)),
+                _ => Math.Round(Math.Sqrt(player.Speed.X * player.Speed.X + player.Speed.Y * player.Speed.Y))
+            };
+            speedometerSamples.Enqueue((int)speed);
+            while (speedometerSamples.Count > 10) speedometerSamples.Dequeue();
+            string text = speedometerSamples.Max().ToString(CultureInfo.InvariantCulture);
+            int totalWidth = text.Length * 4 - 1;
+            int startX = (int)Math.Round(player.Pos.X - camX) - totalWidth / 2;
+            int top = (int)Math.Round(player.Pos.Y - camY - 24f);
+            for (int i = 0; i < text.Length; i++)
+                DrawPicoDigit(g, text[i] - '0', startX + i * 4, top);
+        }
+
+        void DrawPicoDigit(Graphics g, int digit, int x, int y)
+        {
+            for (int oy = -1; oy <= 1; oy++)
+            for (int ox = -1; ox <= 1; ox++)
+                if (ox != 0 || oy != 0)
+                    Sprites.DrawTinted(g, picoDigits[digit], Color.Black, x + ox, y + oy, 3, 5);
+            g.DrawImage(picoDigits[digit], x, y, 3, 5);
+        }
+
+        void DrawHitboxes(Graphics g, float camX, float camY)
+        {
+            if (!hitboxesEnabled) return;
+            using var solidBrush = new SolidBrush(Color.Red);
+            List<Solid> allSolids = player.Solids;
+            foreach (var solid in allSolids)
+                DrawSolidHitbox(g, allSolids, solid, camX, camY, solidBrush);
+            float playerHeight = player.Ducking ? 6f : 11f;
+            using var playerBrush = new SolidBrush(Color.Lime);
+            DrawHollowRect(g, player.Pos.X - 4f - camX, player.Pos.Y - playerHeight - camY,
+                8f, playerHeight, playerBrush);
+            DrawSeekerPaths(g, camX, camY);
+        }
+
+        void DrawSeekerPaths(Graphics g, float camX, float camY)
+        {
+            using var pathPen = new Pen(Color.Red, 1f);
+            using var pathBrush = new SolidBrush(Color.Red);
+            using var endpointBrush = new SolidBrush(Color.Green);
+            foreach (Seeker seeker in seekers)
+            {
+                if (!seeker.DebugPathAttempted) continue;
+                IReadOnlyList<PointF> path = seeker.DebugPath;
+                if (seeker.DebugPathFound && path.Count > 0)
+                {
+                    PointF start = path[0];
+                    for (int i = 1; i < path.Count; i++)
+                    {
+                        PointF next = path[i];
+                        g.DrawLine(pathPen, SnapPx(start.X - camX), SnapPx(start.Y - camY),
+                            SnapPx(next.X - camX), SnapPx(next.Y - camY));
+                        g.FillRectangle(pathBrush, SnapPx(start.X - camX) - 2f,
+                            SnapPx(start.Y - camY) - 2f, 4f, 4f);
+                        start = next;
+                    }
+                    g.FillRectangle(pathBrush, SnapPx(start.X - camX) - 2f,
+                        SnapPx(start.Y - camY) - 2f, 4f, 4f);
+                }
+                PointF from = PathfinderCellCenter(seeker.DebugPathStart);
+                PointF to = PathfinderCellCenter(seeker.DebugPathEnd);
+                g.FillRectangle(endpointBrush, SnapPx(from.X - camX) - 2f,
+                    SnapPx(from.Y - camY) - 2f, 4f, 4f);
+                g.FillRectangle(endpointBrush, SnapPx(to.X - camX) - 2f,
+                    SnapPx(to.Y - camY) - 2f, 4f, 4f);
+            }
+        }
+
+        static PointF PathfinderCellCenter(PointF point)
+            => new PointF((float)Math.Floor(point.X / 8f) * 8f + 4f,
+                (float)Math.Floor(point.Y / 8f) * 8f + 4f);
+
+        void AppendActorDebugStamps(ref int trailCount)
+        {
+            gliderDebugStamp ??= CreateHoldableDebugStamp(glider: true);
+            theoDebugStamp ??= CreateHoldableDebugStamp(glider: false);
+            foreach (Glider glider in gliders)
+            {
+                if (trailCount >= trailStamps.Length) return;
+                trailStamps[trailCount++] = new TrailStamp(gliderDebugStamp,
+                    glider.Pos.X, glider.Pos.Y, 1f);
+            }
+            foreach (TheoCrystal theo in theos)
+            {
+                if (theo.Removed || trailCount >= trailStamps.Length) continue;
+                trailStamps[trailCount++] = new TrailStamp(theoDebugStamp,
+                    theo.Pos.X, theo.Pos.Y, 1f);
+            }
+            foreach (Seeker seeker in seekers)
+            {
+                if (trailCount >= trailStamps.Length) return;
+                int variant = seeker.State == Seeker.StAttack && seeker.Speed.X > 0f ? 1 :
+                    seeker.State == Seeker.StAttack && seeker.Speed.Y < 0f ? 2 : 0;
+                seekerDebugStamps[variant] ??= CreateSeekerDebugStamp(variant);
+                trailStamps[trailCount++] = new TrailStamp(seekerDebugStamps[variant],
+                    seeker.Pos.X, seeker.Pos.Y, 1f);
+            }
+        }
+
+        static Bitmap CreateHoldableDebugStamp(bool glider)
+        {
+            var bitmap = new Bitmap(64, 64, PixelFormat.Format32bppPArgb);
+            using var g = Graphics.FromImage(bitmap);
+            using var physical = new SolidBrush(Color.Red);
+            using var pickup = new SolidBrush(Color.Pink);
+            DrawHollowRect(g, 28f, 22f, 8f, 10f, physical);
+            DrawHollowRect(g, glider ? 22f : 24f, 16f,
+                glider ? 20f : 16f, 22f, pickup);
+            return bitmap;
+        }
+
+        static Bitmap CreateSeekerDebugStamp(int variant)
+        {
+            var bitmap = new Bitmap(64, 64, PixelFormat.Format32bppPArgb);
+            using var g = Graphics.FromImage(bitmap);
+            using var attack = new SolidBrush(Color.Red);
+            using var bounce = new SolidBrush(Color.Aqua);
+            DrawHollowRect(g, 26f, 30f, 12f, 8f, attack);
+            float x = variant == 1 ? 22f : 26f;
+            float width = variant == 0 ? 12f : 16f;
+            DrawHollowRect(g, x, 24f, width, 6f, bounce);
+            return bitmap;
+        }
+
+        /// <summary>Outline a solid, minus the stretches another solid is pressed against.</summary>
+        /// <remarks>
+        /// Occlusion cuts a covered platform into pieces, and outlining each piece whole draws
+        /// a line along every join between them.  A join is inside the shape rather than an
+        /// edge of it, and it reads as the border of one window running on across the window
+        /// behind it.  Border mode never showed this because its pieces are thin enough to be
+        /// drawn as a single stroke, which is the case kept below.
+        /// </remarks>
+        static void DrawSolidHitbox(Graphics g, List<Solid> all, Solid s, float camX, float camY, Brush brush)
+        {
+            float width = s.R - s.L, height = s.B - s.T;
+            if ((height <= 2 && width > height) || (width <= 2 && height > width))
+            {
+                DrawSolidHitbox(g, s.L - camX, s.T - camY, width, height, brush);
+                return;
+            }
+
+            var covered = new List<PointF>();
+
+            void Edge(bool horizontal, bool nearSide)
+            {
+                float at = horizontal ? (nearSide ? s.T : s.B) : (nearSide ? s.L : s.R);
+                float from = horizontal ? s.L : s.T, to = horizontal ? s.R : s.B;
+                covered.Clear();
+                foreach (Solid q in all)
+                {
+                    // Does q fill the space immediately outside this edge?  A solid exactly
+                    // level with it on the far side does; the solid itself never can.
+                    bool presses = horizontal
+                        ? (nearSide ? q.T < at && q.B >= at : q.B > at && q.T <= at)
+                        : (nearSide ? q.L < at && q.R >= at : q.R > at && q.L <= at);
+                    bool alongside = horizontal
+                        ? q.L < s.R && q.R > s.L
+                        : q.T < s.B && q.B > s.T;
+                    if (presses && alongside)
+                        covered.Add(horizontal
+                            ? new PointF(Math.Max(q.L, from), Math.Min(q.R, to))
+                            : new PointF(Math.Max(q.T, from), Math.Min(q.B, to)));
+                }
+                foreach (PointF span in ExposedSpans(from, to, covered))
+                {
+                    int length = Math.Max(1, (int)Math.Round(span.Y - span.X));
+                    if (horizontal)
+                        g.FillRectangle(brush, (int)Math.Round(span.X - camX),
+                            (int)Math.Round(at - camY), length, 1);
+                    else
+                        g.FillRectangle(brush, (int)Math.Round(at - camX),
+                            (int)Math.Round(span.X - camY), 1, length);
+                }
+            }
+
+            Edge(horizontal: true, nearSide: true);
+            Edge(horizontal: true, nearSide: false);
+            Edge(horizontal: false, nearSide: true);
+            Edge(horizontal: false, nearSide: false);
+        }
+
+        /// <summary>The parts of [from,to] left over once the covered spans are removed.</summary>
+        static List<PointF> ExposedSpans(float from, float to, List<PointF> covered)
+        {
+            var spans = new List<PointF> { new PointF(from, to) };
+            foreach (PointF cover in covered)
+            {
+                var next = new List<PointF>(spans.Count + 1);
+                foreach (PointF span in spans)
+                {
+                    if (cover.Y <= span.X || cover.X >= span.Y) { next.Add(span); continue; }
+                    if (span.X < cover.X) next.Add(new PointF(span.X, cover.X));
+                    if (span.Y > cover.Y) next.Add(new PointF(cover.Y, span.Y));
+                }
+                spans = next;
+                if (spans.Count == 0) break;
+            }
+            return spans;
+        }
+
+        static void DrawSolidHitbox(Graphics g, float x, float y, float width, float height, Brush brush)
+        {
+            int left = (int)Math.Round(x), top = (int)Math.Round(y);
+            int w = Math.Max(1, (int)Math.Round(width));
+            int h = Math.Max(1, (int)Math.Round(height));
+            // A physical 8px window border is often only two game pixels thick.
+            // Drawing both sides then looks like a solid 2px band instead of the
+            // player's single-pixel debug stroke.
+            if (h <= 2 && w > h) { g.FillRectangle(brush, left, top, w, 1); return; }
+            if (w <= 2 && h > w) { g.FillRectangle(brush, left, top, 1, h); return; }
+            DrawHollowRect(g, x, y, width, height, brush);
+        }
+
+        static void DrawHollowRect(Graphics g, float x, float y, float width, float height, Brush brush)
+        {
+            int left = (int)Math.Round(x), top = (int)Math.Round(y);
+            int w = Math.Max(1, (int)Math.Round(width));
+            int h = Math.Max(1, (int)Math.Round(height));
+            g.FillRectangle(brush, left, top, w, 1);
+            g.FillRectangle(brush, left, top + h - 1, w, 1);
+            g.FillRectangle(brush, left, top, 1, h);
+            g.FillRectangle(brush, left + w - 1, top, 1, h);
+        }
+
+        /// <summary>The tail from Cateline, by ladyfey: gamebanana.com/mods/251793.</summary>
+        void DrawCatTail(Graphics g, float camX, float camY)
+        {
+            if (!catTailEnabled || !catTailStarted) return;
+            var texture = Sprites.Get("hair00", false);
+            if (texture == null) return;
+            for (int i = 0; i < CatTailCount; i++)
+            {
+                float x = SnapPx(catTailNodes[i].X - camX);
+                float y = SnapPx(catTailNodes[i].Y - camY);
+                // Use the colored node's exact geometry for the four-direction
+                // outline, just like PlayerHair.Render; only the ±1px offsets differ.
+                const float tailSize = 3f;
+                DrawTintedSafe(g, texture, Color.Black, x - tailSize / 2f - 1, y - tailSize / 2f, tailSize, tailSize);
+                DrawTintedSafe(g, texture, Color.Black, x - tailSize / 2f + 1, y - tailSize / 2f, tailSize, tailSize);
+                DrawTintedSafe(g, texture, Color.Black, x - tailSize / 2f, y - tailSize / 2f - 1, tailSize, tailSize);
+                DrawTintedSafe(g, texture, Color.Black, x - tailSize / 2f, y - tailSize / 2f + 1, tailSize, tailSize);
+            }
+            for (int i = 0; i < CatTailCount; i++)
+            {
+                float x = SnapPx(catTailNodes[i].X - camX);
+                float y = SnapPx(catTailNodes[i].Y - camY);
+                DrawTintedSafe(g, texture, player.HairColor, x - 1.5f, y - 1.5f, 3f, 3f);
+            }
+        }
+
+        static float HairSegmentScale(int i, int count)
+            => 0.25f + (1f - (float)i / count) * 0.75f;
+
+        // Pixel-perfect: snap float game pixels to integers (even rounding keeps w/2 integer so edges stay on-pixel)
+        static float SnapPx(float v) => (float)Math.Round(v);
+        static float SnapEven(float v) => (float)(Math.Round(v / 2f) * 2f);
+
+        static void DrawTintedSafe(Graphics g, Bitmap tex, Color c, float x, float y, float w, float h, float alpha = 1f)
+            => Sprites.DrawTinted(g, tex, c, x, y, w, h, alpha);
+
+        // ================= Mouse drag =================
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_LBUTTONDOWN = 0x0201;
+            const int WM_MOUSEMOVE = 0x0200;
+            const int WM_LBUTTONUP = 0x0202;
+            const int WM_RBUTTONUP = 0x0205;
+
+            switch (m.Msg)
+            {
+                case WM_LBUTTONDOWN:
+                    // Normally removing WS_EX_NOACTIVATE already activates on mouse-down; explicit
+                    // Activate also covers odd activation behavior from some layered windows / window managers.
+                    Activate();
+                    dragging = true;
+                    player.BeingDragged = true;
+                    var feet = new Point((int)(player.Pos.X * GameScale), (int)(player.Pos.Y * GameScale));
+                    dragGrabOffset = new Point(feet.X - Cursor.Position.X, feet.Y - Cursor.Position.Y);
+                    lastCursor = Cursor.Position;
+                    cursorVel = new PointF(0, 0);
+                    break;
+                case WM_MOUSEMOVE:
+                    if (dragging)
+                    {
+                        var cur = Cursor.Position;
+                        float dt = 1f / 60f;
+                        cursorVel = new PointF(
+                            cursorVel.X * 0.7f + (cur.X - lastCursor.X) / dt * 0.3f,
+                            cursorVel.Y * 0.7f + (cur.Y - lastCursor.Y) / dt * 0.3f);
+                        lastCursor = cur;
+                        // Whole game pixels only: the physics grid the climb checks rely on.
+                        player.Pos = new PointF(
+                            ToGamePixels(cur.X + dragGrabOffset.X),
+                            ToGamePixels(cur.Y + dragGrabOffset.Y));
+                    }
+                    break;
+                case WM_LBUTTONUP:
+                    if (dragging)
+                    {
+                        dragging = false;
+                        player.BeingDragged = false;
+                        // Throw: inherit mouse velocity (convert to game units, clamp)
+                        float vx = cursorVel.X / GameScale * 0.6f;
+                        float vy = cursorVel.Y / GameScale * 0.6f;
+                        float len = (float)Math.Sqrt(vx * vx + vy * vy);
+                        if (len > 400) { vx = vx / len * 400; vy = vy / len * 400; }
+                        if (len > 30) player.Speed = new PointF(vx, vy);
+                        else player.Speed = new PointF(0, 0);
+                    }
+                    break;
+                case WM_RBUTTONUP:
+                    if (withoutMadeline) ShowFallbackMenu(Cursor.Position);
+                    else OpenFlyout(Cursor.Position);
+                    break;
+            }
+            base.WndProc(ref m);
+        }
+
+        // ================= Tray =================
+
+        internal void SaveSettings()
+        {
+            settings.Scale = pendingScale > 0 ? pendingScale : GameScale;
+            settings.InputEnabled = InputEnabled;
+            settings.PadInputEnabled = PadInputEnabled;
+            settings.InputWhenUnfocused = InputWhenUnfocused;
+            settings.IdleAutonomy = IdleAutonomyEnabled;
+            settings.AlwaysOnTop = AlwaysOnTop;
+            settings.ParticlesEnabled = ParticlesEnabled;
+            settings.FreezeFramesEnabled = player.FreezeFramesEnabled;
+            settings.InfiniteStamina = player.InfiniteStamina;
+            settings.Invincible = player.Invincible;
+            settings.SuperDashing = player.SuperDashing;
+            settings.DashMode = player.DashMode;
+            settings.GrabMode = (int)grabInput.Mode;
+            settings.FlyoutTab = flyoutTab;
+            settings.Theme = FlyoutPalette.Theme;
+            settings.FlyoutOpen = string.Join(",", flyoutOpen);
+            settings.Language = Loc.CurrentCode;
+            settings.Skin = skinManager.Active?.Id ?? SkinManager.DefaultId;
+            settings.CatTailEnabled = catTailEnabled;
+            settings.CatBangsEnabled = catBangsEnabled;
+            settings.CustomHairColorsEnabled = customHairColorsEnabled;
+            settings.HairColor0 = RgbValue(customHairColors[0]);
+            settings.HairColor1 = RgbValue(customHairColors[1]);
+            settings.HairColor2 = RgbValue(customHairColors[2]);
+            settings.SpeedometerMode = speedometerMode;
+            settings.HitboxesEnabled = hitboxesEnabled;
+            settings.WindowMode = windowMode;
+            settings.IgnoreMaximizedWindows = ignoreMaximizedWindows;
+            settings.AvoidFullscreen = avoidFullscreen;
+            settings.RespawnReversalEnabled = player.RespawnReversalEnabled;
+            settings.EdgeWrapMode = edgeWrapMode;
+            settings.EdgeWrapOneMonitor = edgeWrapOneMonitor;
+            settings.ElytraEnabled = player.ElytraEnabled;
+            settings.SfxMode = soundEffects.Mode;
+            settings.SfxVolume = soundEffects.Volume;
+            settings.SurfaceSoundIndex = player.NormalSurfaceSoundIndex;
+            settings.Save();
+        }
+
+        /// <summary>Settle which Celeste the artwork and sound come from, before they are read.</summary>
+        /// <remarks>
+        /// It is a setting rather than only a search so that a copy in an unusual place, or one
+        /// of several, can be named once and kept. The first run fills it in with whatever
+        /// looking around turns up, which is the whole answer for an ordinary Steam install;
+        /// only when that finds nothing is the user asked, and a bundled build carries the
+        /// game's files beside it and so is never asked at all.
+        /// </remarks>
+        void ResolveCelesteInstall()
+        {
+            CelesteInstall.Chosen = settings.CelestePath;
+            if (!NeedsCelesteInstall)
+            {
+                Log("Celeste content: bundled beside the app, so no install is needed");
+                return;
+            }
+            string found = CelesteInstall.Directory;   // the setting first, then the usual places
+            if (found == null)
+            {
+                if (FlyoutDialog.Ask(null, FlyoutDialog.Kind.Question, Loc.T("Celeste.NoneFound"),
+                        Loc.T("Celeste.Why") + Environment.NewLine + Loc.T("Celeste.PickFolder"),
+                        new[] { Loc.T("Common.Cancel"), Loc.T("Menu.CelesteChoose") }) == 1)
+                    found = AskForCelesteFolder();
+                if (found == null)
+                {
+                    Log("no Celeste install: running without her sprites or sounds");
+                    FlyoutDialog.Tell(null, FlyoutDialog.Kind.Warning, Loc.T("Celeste.NoneFound"),
+                        Loc.T("Celeste.Without"));
+                }
+            }
+            else if (!CelesteInstall.IsComplete(found) &&
+                     !found.Equals(settings.CelestePath, StringComparison.OrdinalIgnoreCase))
+            {
+                // Broken rather than absent, and not one already lived with: half an install
+                // otherwise comes up as missing sprites or silence with nothing said about why.
+                Log("incomplete Celeste at " + found + ": missing " +
+                    string.Join(", ", CelesteInstall.MissingFrom(found)));
+                if (AskIncomplete(found, Loc.T("Celeste.UseAnywayButton"), Loc.T("Menu.CelesteChoose")) == 1)
+                    found = AskForCelesteFolder() ?? found;
+            }
+            if (found == null || found.Equals(settings.CelestePath, StringComparison.OrdinalIgnoreCase))
+                return;
+            settings.CelestePath = found;
+            CelesteInstall.Chosen = found;
+            settings.Save();
+            Log("Celeste install: " + found);
+        }
+
+        /// <summary>
+        /// An install that lacks files: which ones, in a card, and the two ways on. The answer
+        /// is the index of the button pressed, <paramref name="second"/> being the accent one.
+        /// </summary>
+        int AskIncomplete(string folder, string first, string second)
+        {
+            var missing = CelesteInstall.MissingFrom(folder);
+            int shown = Math.Min(missing.Count, 6);
+            string list = string.Join("\n", missing.GetRange(0, shown));
+            if (missing.Count > shown)
+                list += "\n" + Loc.Format("Celeste.AndMore", missing.Count - shown);
+            return FlyoutDialog.Ask(null, FlyoutDialog.Kind.Warning, Loc.T("Celeste.IncompleteTitle"),
+                Loc.Format("Celeste.Incomplete", folder), new[] { first, second }, list);
+        }
+
+        /// <summary>Ask for the folder Celeste is in, until it is one or the user gives up.</summary>
+        string AskForCelesteFolder()
+        {
+            while (true)
+            {
+                using var dialog = new FolderBrowserDialog
+                {
+                    Description = Loc.T("Celeste.PickFolder"),
+                    UseDescriptionForTitle = true,
+                    ShowNewFolderButton = false,
+                    SelectedPath = CelesteInstall.Directory ?? settings.CelestePath ?? ""
+                };
+                if (dialog.ShowDialog() != DialogResult.OK) return null;
+                string folder = System.IO.Path.GetFullPath(dialog.SelectedPath);
+                if (CelesteInstall.IsComplete(folder)) return folder;
+                if (!CelesteInstall.IsInstall(folder))
+                {
+                    if (FlyoutDialog.Ask(null, FlyoutDialog.Kind.Warning, Loc.T("Celeste.NoExeThere"),
+                            folder, new[] { Loc.T("Common.Cancel"), Loc.T("Celeste.ChooseAgain") }) != 1)
+                        return null;
+                    continue;
+                }
+                // Celeste, but not all of it: theirs to decide, since some of her beats none.
+                if (AskIncomplete(folder, Loc.T("Celeste.ChooseAgain"), Loc.T("Celeste.UseAnywayButton")) == 1)
+                    return folder;
+            }
+        }
+
+        /// <summary>Take a folder for the install, and offer the restart that puts it to use.</summary>
+        void UseCelesteFolder(string folder)
+        {
+            settings.CelestePath = folder ?? "";
+            CelesteInstall.Chosen = folder;
+            SaveSettings();
+            Log("Celeste install: " + (CelesteInstall.Directory ?? "none"));
+            // Her sprites and the sound banks are both read once, at startup, so a new folder
+            // only really takes over at the next one. Named in the asking, since detecting one
+            // can change it to a folder the user never typed or picked.
+            if (FlyoutDialog.Ask(null, FlyoutDialog.Kind.Question, Loc.T("Celeste.RestartToApply"),
+                    folder, new[] { Loc.T("Update.Later"), Loc.T("Sfx.RestartNow") }) == 1)
+            {
+                restartAfterExit = true;
+                ExitApp();
+            }
+        }
+
+        /// <summary>Take what looking finds, whatever has been named before.</summary>
+        void DetectCeleste()
+        {
+            string found = CelesteInstall.Detected();
+            if (found == null)
+            {
+                FlyoutDialog.Tell(null, FlyoutDialog.Kind.Warning, Loc.T("Celeste.NoneFound"), Loc.T("Celeste.Why"));
+                return;
+            }
+            if (!CelesteInstall.IsComplete(found) &&
+                AskIncomplete(found, Loc.T("Common.Cancel"), Loc.T("Celeste.UseAnywayButton")) != 1)
+                return;
+            if (found.Equals(CelesteInstall.Directory, StringComparison.OrdinalIgnoreCase))
+            {
+                // Already the one in use: worth saying so, and worth writing down, since what
+                // was found by looking today may not be found by looking tomorrow.
+                settings.CelestePath = found;
+                SaveSettings();
+                FlyoutDialog.Tell(null, FlyoutDialog.Kind.Info, Loc.T("Celeste.FoundTitle"), found);
+                return;
+            }
+            UseCelesteFolder(found);
+        }
+
+        void ChangeLanguage(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return;
+            if (Loc.CurrentCode.Equals(code, StringComparison.OrdinalIgnoreCase)) return;
+            Loc.SetLanguage(code);
+            SaveSettings();
+            // After the click unwinds, so the control that asked is not disposed mid-dispatch.
+            // The flyout's text is fixed when it is built, so it is made again in the new
+            // language, where it was and on the tab it was showing.
+            BeginInvoke(new Action(() =>
+            {
+                tray.Text = Loc.T("App.Name");
+                RebuildFlyout();
+            }));
+        }
+
+        /// <summary>
+        /// The tray's menu when nothing was found to draw her from: with no Madeline on the
+        /// desktop, none of the flyout -- skins, hair, what to spawn -- is about anything. Two
+        /// things still are: where the game is, and the way out.
+        /// </summary>
+        /// <remarks>
+        /// Where it is reading from is read as the menu opens rather than kept: looking involves
+        /// the registry and every drive, and the answer can change while the pet is running.
+        /// </remarks>
+        void ShowFallbackMenu(Point at)
+        {
+            var menu = new FlyoutMenu();
+            if (NeedsCelesteInstall)
+            {
+                menu.Note(Loc.T("Celeste.Why"));
+                menu.Note(Loc.Format("Celeste.InUse", CelesteInstall.Directory ?? Loc.T("Celeste.None")), path: true);
+                menu.Item("\uE721", Loc.T("Menu.CelesteDetect"), DetectCeleste);
+                menu.Item("\uE8B7", Loc.T("Menu.CelesteChoose"), () =>
+                {
+                    string folder = AskForCelesteFolder();
+                    if (folder == null ||
+                        folder.Equals(CelesteInstall.Directory, StringComparison.OrdinalIgnoreCase)) return;
+                    UseCelesteFolder(folder);
+                });
+                menu.Separator();
+            }
+            menu.Item("\uE7E8", Loc.T("Common.Exit"), ExitApp);
+            menu.ShowAt(at);
+        }
+
+        /// <summary>
+        /// A heading, and the rule above it. Headings are not items: they cannot be clicked,
+        /// hovered or reached with the keyboard, which is what makes them read as headings
+        /// rather than as options that happen to be unavailable.
+        /// </summary>
+
+
+        /// <summary>Open the About window once the menu click has unwound.</summary>
+        void ShowAbout() => BeginInvoke(new Action(() =>
+        {
+            using var about = new AboutDialog();
+            about.ShowDialog();
+        }));
+
+        bool askingGitHub;
+
+        /// <summary>Ask the build server whether it has anything newer, and say so either way.</summary>
+        /// <remarks>
+        /// After the click has unwound, as ShowAbout is, since this puts up a modal dialog too.
+        /// The guard is against a second one behind the first: the menu closes on click, so
+        /// nothing about it says a dialog is already on its way.
+        /// </remarks>
+        void CheckForUpdate() => BeginInvoke(new Action(() =>
+        {
+            if (askingGitHub) return;
+            askingGitHub = true;
+            try { UpdateCheck.Ask(this, ExitApp); }
+            finally { askingGitHub = false; }
+        }));
+
+        /// <summary>
+        /// Whether an install is any of the pet's business. A bundled build carries the artwork
+        /// and the banks beside the exe and reads those in preference to anything installed, so
+        /// naming a folder there would change nothing and offering to is a lie.
+        /// </summary>
+        static bool NeedsCelesteInstall
+            => !CelesteInstall.HasBundledContent || !CelesteInstall.HasBundledAudio;
+
+        Icon BuildTrayIcon()
+        {
+            // Build tray icon from Madeline portrait (not pixel art; smooth downscale).
+            // Shipped beside the app, or her dialogue portrait out of Celeste's own atlas.
+            var path = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "portrait.png");
+            try
+            {
+                using (var src = System.IO.File.Exists(path)
+                    ? new Bitmap(path)
+                    : new Bitmap(Sprites.Get(Sprites.PortraitId, false)))
+                {
+                    var bmp = new Bitmap(32, 32, PixelFormat.Format32bppPArgb);
+                    using (var g = Graphics.FromImage(bmp))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g.SmoothingMode = SmoothingMode.HighQuality;
+                        g.CompositingQuality = CompositingQuality.HighQuality;
+                        g.DrawImage(src, 0, 0, 32, 32);
+                    }
+                    IntPtr hIcon = bmp.GetHicon();
+                    trayIconHandle = hIcon;   // Keep handle; DestroyIcon on exit
+                    bmp.Dispose();
+                    return Icon.FromHandle(hIcon);
+                }
+            }
+            catch { return SystemIcons.Application; }
+        }
+
+        /// <summary>Put her back on the displays if she ended up off them.</summary>
+        /// <remarks>
+        /// The perimeter of the monitors is solid, so she can neither walk nor fall off it, but
+        /// a drag sets her position outright and can leave her anywhere -- past the edge she
+        /// would simply keep falling out of sight.  An axis set to wrap is left alone, leaving
+        /// the screen being the whole point of it.
+        /// </remarks>
+        void SnapIntoView()
+        {
+            if (dragging || introWakeUp || player.IsDead || player.IsRespawning) return;
+            PointF onView = ClampIntoDisplays(
+                player.Pos, 4f, player.CurrentHitHeight, 0f, monitorGameBounds, edgeWrapMode);
+            // WrapBy carries her hair and anything she is holding along with her.
+            if (onView != player.Pos)
+                player.WrapBy(onView.X - player.Pos.X, onView.Y - player.Pos.Y);
+        }
+
+        /// <summary>The same for everything else loose on the desktop.</summary>
+        /// <remarks>
+        /// They can all be dragged, so they can all be dropped past an edge, and none of them
+        /// has anything that would bring them back: the crystal would break, and the jelly and
+        /// the seeker would drift off wherever they were let go.  Anything being carried or
+        /// held by the cursor is left alone, its position belonging to whoever has it.
+        /// </remarks>
+        void SnapEntitiesIntoView()
+        {
+            if (introWakeUp || monitorGameBounds.Count == 0) return;
+
+            foreach (TheoCrystal theo in theos)
+            {
+                if (theo.Removed || theo.IsHeld || theo.BeingDragged || theo.IsDying) continue;
+                PointF onView = ClampIntoDisplays(theo.Pos, TheoCrystal.HalfWidth,
+                    TheoCrystal.ColliderHeight, 0f, monitorGameBounds, edgeWrapMode);
+                if (onView != theo.Pos) theo.SnapIntoView(onView);
+            }
+            foreach (Glider glider in gliders)
+            {
+                if (glider.IsHeld || glider.BeingDragged) continue;
+                PointF onView = ClampIntoDisplays(glider.Pos, Glider.HalfWidth,
+                    Glider.ColliderHeight, 0f, monitorGameBounds, edgeWrapMode);
+                if (onView != glider.Pos) glider.SnapIntoView(onView);
+            }
+            foreach (Seeker seeker in seekers)
+            {
+                if (seeker.Removed || seeker.BeingDragged) continue;
+                // The seeker's 6x6 collider is centred on its position, not hung below it.
+                PointF onView = ClampIntoDisplays(seeker.Pos, Seeker.HalfSize, Seeker.HalfSize,
+                    Seeker.HalfSize, monitorGameBounds, edgeWrapMode);
+                if (onView != seeker.Pos) seeker.SnapIntoView(onView);
+            }
+        }
+
+        /// <summary>Where it belongs if it has ended up off the displays; unchanged if not.</summary>
+        /// <remarks>
+        /// The collider is given as its reach from the position rather than assumed, since the
+        /// crystal and the jelly hang below theirs like she does while the seeker is centred
+        /// on its own.
+        /// </remarks>
+        internal static PointF ClampIntoDisplays(PointF pos, float halfWidth, float above,
+            float below, List<RectangleF> displays, int edgeWrapMode)
+        {
+            if (displays.Count == 0 || edgeWrapMode == 3) return pos;
+
+            // Wholly on one display is the answer almost every frame, and worth having before
+            // the general test below, which allocates to handle straddling a seam.
+            foreach (RectangleF display in displays)
+                if (pos.X - halfWidth >= display.Left && pos.X + halfWidth <= display.Right &&
+                    pos.Y - above >= display.Top && pos.Y + below <= display.Bottom)
+                    return pos;
+
+            var box = new Win32.RECT
+            {
+                Left = (int)Math.Floor(pos.X - halfWidth),
+                Top = (int)Math.Floor(pos.Y - above),
+                Right = (int)Math.Ceiling(pos.X + halfWidth),
+                Bottom = (int)Math.Ceiling(pos.Y + below),
+            };
+            var rects = new List<Win32.RECT>(displays.Count);
+            foreach (RectangleF display in displays)
+                rects.Add(new Win32.RECT
+                {
+                    Left = (int)display.Left, Top = (int)display.Top,
+                    Right = (int)display.Right, Bottom = (int)display.Bottom,
+                });
+            // Nothing left of her once the displays are taken away means she is wholly on them,
+            // which is also how straddling the seam between two of them comes out fine.
+            if (SubtractRects(box, rects).Count == 0) return pos;
+
+            RectangleF nearest = displays[0];
+            float nearestDistance = float.MaxValue;
+            foreach (RectangleF display in displays)
+            {
+                float dx = pos.X - Math.Max(display.Left, Math.Min(display.Right, pos.X));
+                float dy = pos.Y - Math.Max(display.Top, Math.Min(display.Bottom, pos.Y));
+                float distance = dx * dx + dy * dy;
+                if (distance < nearestDistance) { nearestDistance = distance; nearest = display; }
+            }
+
+            float x = pos.X, y = pos.Y;
+            if ((edgeWrapMode & 1) == 0)
+                x = Math.Max(nearest.Left + halfWidth, Math.Min(nearest.Right - halfWidth, x));
+            if ((edgeWrapMode & 2) == 0)
+                y = Math.Max(nearest.Top + above, Math.Min(nearest.Bottom - below, y));
+            return new PointF(x, y);
+        }
+
+        // Auto-reset when far off-screen (prevents infinite fall / being thrown off the virtual desktop)
+        void CheckAutoReset()
+        {
+            if (dragging || introWakeUp) return;
+            var vs = SystemInformation.VirtualScreen;
+            float gx = player.Pos.X * GameScale;
+            float gy = player.Pos.Y * GameScale;
+            // Threshold: more than 1 screen width horizontally or 1.5 screen heights vertically counts as "far away"
+            bool far = gx < vs.Left - vs.Width || gx > vs.Right + vs.Width ||
+                       gy < vs.Top - vs.Height * 1.5f || gy > vs.Bottom + vs.Height * 1.5f;
+            if (far) ResetPosition();
+        }
+
+        // Reset: appear at top-center of the current screen, then free-fall
+        void ResetPosition()
+        {
+            // Clamp into the virtual screen first (prevents wrong monitor pick when coords overflow during infinite fall)
+            var vs = SystemInformation.VirtualScreen;
+            float px = Math.Max(vs.Left, Math.Min(player.Pos.X * GameScale, vs.Right - 1f));
+            float py = Math.Max(vs.Top, Math.Min(player.Pos.Y * GameScale, vs.Bottom - 1f));
+            var sc = Screen.FromPoint(new Point((int)px, (int)py));
+            var wa = sc.WorkingArea;
+            player.ResetTo(new PointF(ToGamePixels((wa.Left + wa.Right) / 2), ToGamePixels(wa.Top) + 5));
+            dragging = false;
+            if (introWakeUp)
+            {
+                introWakeUp = false;
+                player.PlaySprite("idle", true);
+            }
+            PetWindow.Log("reset pos to " + player.Pos.X.ToString("F1") + "," + player.Pos.Y.ToString("F1"));
+        }
+
+        void ExitApp()
+        {
+            running = false;
+            tray.Visible = false;
+            // Close after the ToolStrip click unwinds. Application.Exit enumerates all
+            // open forms; disposing the composition host during that enumeration caused
+            // "Collection was modified" (seen on .NET 8; the ordering matters regardless).
+            BeginInvoke(new Action(Close));
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            running = false;
+            SaveSettings();
+            // Wait for the game-loop thread to finish the current frame before releasing resources so the render thread is not still using GPU objects
+            if (loopThread != null && loopThread != Thread.CurrentThread)
+                loopThread.Join(1500);
+            // Moon mode holds windows off their homes; leaving them there would be leaving the
+            // desk untidied. After the join, so the loop cannot drift them again afterwards.
+            moonWindows.Restore();
+            kevinWindows.Restore();
+            soundEffects.Dispose();
+            tray.Visible = false;
+            tray.Dispose();
+            // Release tray-icon HICON and Direct3D / DirectComposition resources
+            if (trayIconHandle != IntPtr.Zero) { Win32.DestroyIcon(trayIconHandle); trayIconHandle = IntPtr.Zero; }
+            presenter?.Dispose();
+            foreach (var trail in dashTrails) trail.Mask?.Dispose();
+            dashTrails.Clear();
+            lock (gliderWindowLock)
+            {
+                foreach (var window in gliderWindows.Values) window.Dispose();
+                gliderWindows.Clear();
+            }
+            lock (theoWindowLock)
+            {
+                foreach (var window in theoWindows.Values) window.Dispose();
+                theoWindows.Clear();
+            }
+            foreach (var cached in gliderStampCache.Values) cached.Bitmap?.Dispose();
+            gliderStampCache.Clear();
+            lock (seekerWindowLock)
+            {
+                foreach (var window in seekerWindows.Values) window.Dispose();
+                seekerWindows.Clear();
+            }
+            lock (bumperWindowLock)
+            {
+                foreach (var window in bumperWindows.Values) window.Dispose();
+                bumperWindows.Clear();
+            }
+            lock (pufferWindowLock)
+            {
+                foreach (var window in pufferWindows.Values) window.Dispose();
+                pufferWindows.Clear();
+            }
+            foreach (var cached in pufferStampCache.Values) cached.Bitmap?.Dispose();
+            pufferStampCache.Clear();
+            foreach (var cached in bumperStampCache.Values) cached.Bitmap?.Dispose();
+            bumperStampCache.Clear();
+            foreach (var cached in seekerStampCache.Values) cached.Bitmap?.Dispose();
+            seekerStampCache.Clear();
+            foreach (Seeker seeker in seekers)
+                foreach (SeekerTrail trail in seeker.Trails) trail.Stamp?.Dispose();
+            foreach (Bitmap bitmap in seekerParticleBitmaps.Values) bitmap.Dispose();
+            seekerParticleBitmaps.Clear();
+            gliderDebugStamp?.Dispose();
+            theoDebugStamp?.Dispose();
+            foreach (Bitmap bitmap in seekerDebugStamps) bitmap?.Dispose();
+            foreach (var digit in picoDigits) digit?.Dispose();
+            foreach (Bitmap stamp in slashStamps.Values) stamp.Dispose();
+            slashStamps.Clear();
+            compositionHost?.Close();
+            compositionHost?.Dispose();
+            // Started here rather than at the click so the new copy finds settings.txt written,
+            // the tray icon gone and the sound device free, instead of racing this one for them.
+            if (restartAfterExit)
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = Environment.ProcessPath,
+                        WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
+                        UseShellExecute = true
+                    });
+                }
+                catch (Exception ex) { Log("restart failed: " + ex.Message); }
+            }
+            base.OnFormClosing(e);
+        }
+    }
+
+    /// <summary>
+    /// Stationary, click-through virtual-desktop host for the DirectComposition tree.
+    /// Input is handled by PetWindow's small invisible body-sized HWND instead.
+    /// </summary>
+    sealed class CompositionHost : Form
+    {
+        readonly bool topmost;
+
+        public CompositionHost(Rectangle bounds, bool topmost)
+        {
+            this.topmost = topmost;
+            FormBorderStyle = FormBorderStyle.None;
+            AutoScaleMode = AutoScaleMode.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            Bounds = bounds;
+            Text = "Desk Madeline Renderer";
+        }
+
+        protected override bool ShowWithoutActivation => true;
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                const int WS_EX_TOPMOST = 0x00000008;
+                var cp = base.CreateParams;
+                cp.ExStyle |= Win32.WS_EX_TOOLWINDOW | Win32.WS_EX_TRANSPARENT |
+                              Win32.WS_EX_NOACTIVATE | Win32.WS_EX_LAYERED;
+                if (topmost) cp.ExStyle |= WS_EX_TOPMOST;
+                return cp;
+            }
+        }
+    }
+
+    /// <summary>Raise timer resolution (winmm).</summary>
+    static class TimePeriod
+    {
+        [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint uMilliseconds);
+        [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint uMilliseconds);
+        public static void Begin(uint ms) => timeBeginPeriod(ms);
+        public static void End(uint ms) => timeEndPeriod(ms);
+    }
+}
